@@ -1,0 +1,5 @@
+# dsh-wdc-computer-use — 只插入本插件一行，不替换任何官方组件。
+# 能力来自本机 Win Desktop Control（Python MCP Server，stdio），由 lib/index.js 桥接。
+- insert:
+    - id: wdc-computer-use
+      name: dsh-wdc-computer-use

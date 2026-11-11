@@ -1,0 +1,124 @@
+<div id="wdc-feedback-preview" aria-label="电脑操作提示模拟预览">
+  <style>
+    #wdc-feedback-preview {
+      color-scheme: light dark;
+      --wdc-surface:light-dark(#f6f8fb,#171d26);--wdc-paper:light-dark(#ffffff,#222b38);
+      --wdc-ink:light-dark(#202c3c,#e7edf5);--wdc-muted:light-dark(#647287,#a9b5c5);
+      --wdc-line:light-dark(#dae2ec,#374457);--wdc-accent:light-dark(#1769aa,#72bfff);
+      --wdc-panel:light-dark(#ffffff,#253040);--wdc-text:var(--wdc-ink);--wdc-border:var(--wdc-line);
+      --wdc-quiet:var(--wdc-muted);--wdc-active:var(--wdc-accent);
+      --wdc-waiting:light-dark(#966100,#f5c66c);--wdc-error:light-dark(#bd3b3b,#ff9999);
+      font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;color:var(--wdc-ink);width:100%;
+    }
+    #wdc-feedback-preview * {box-sizing:border-box;}
+    #wdc-feedback-preview .wdc-heading {display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
+    #wdc-feedback-preview .wdc-heading strong {font-weight:500;}
+    #wdc-feedback-preview .wdc-subtitle {color:var(--wdc-muted);font-size:12px;}
+    #wdc-feedback-preview .wdc-controls {display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:14px;}
+    #wdc-feedback-preview label {display:flex;gap:5px;flex-direction:column;font-size:12px;}
+    #wdc-feedback-preview label.wdc-check {flex-direction:row;align-items:center;min-height:34px;}
+    #wdc-feedback-preview select,#wdc-feedback-preview button {
+      font:inherit;font-size:13px;color:var(--wdc-ink);background:var(--wdc-paper);border:1px solid var(--wdc-line);
+      padding:7px 10px;border-radius:7px;min-height:34px;
+    }
+    #wdc-feedback-preview .wdc-primary {background:var(--wdc-ink);color:var(--wdc-paper);border-color:transparent;}
+    #wdc-feedback-preview .wdc-opacity {width:130px;min-height:34px;margin:0;accent-color:var(--wdc-accent);}
+    #wdc-feedback-preview input[type=checkbox] {accent-color:var(--wdc-accent);}
+    #wdc-feedback-preview .wdc-screen {position:relative;isolation:isolate;overflow:hidden;height:360px;background:var(--wdc-paper);border:1px solid var(--wdc-line);border-radius:10px;}
+    #wdc-feedback-preview .wdc-app-title {height:35px;display:flex;align-items:center;padding:0 15px;background:var(--wdc-surface);color:var(--wdc-muted);font-size:12px;border-bottom:1px solid var(--wdc-line);}
+    #wdc-feedback-preview .wdc-editor {padding:30px 24px;color:var(--wdc-muted);font-size:13px;user-select:none;}
+    #wdc-feedback-preview .wdc-editor p {margin:0 0 9px;}
+    #wdc-feedback-preview .wdc-line {height:1px;background:var(--wdc-line);margin-top:24px;max-width:68%;opacity:0.45;}
+    #wdc-feedback-preview .wdc-target {position:absolute;left:38%;top:46%;}
+    #wdc-feedback-preview .wdc-taskbar {position:absolute;bottom:0;left:0;right:0;height:40px;background:var(--wdc-surface);border-top:1px solid var(--wdc-line);display:flex;align-items:center;padding:0 15px;gap:10px;color:var(--wdc-muted);font-size:12px;}
+    #wdc-feedback-preview .wdc-task-dot {height:7px;width:7px;border-radius:50%;background:var(--wdc-muted);opacity:0.55;}
+    #wdc-feedback-preview .wdc-overlay {position:absolute;inset:0;pointer-events:none;}
+    #wdc-feedback-preview .wdc-detail {margin-top:10px;color:var(--wdc-muted);font-size:12px;min-height:18px;}
+    @media(max-width:420px) {
+      #wdc-feedback-preview .wdc-screen {height:310px;}
+      #wdc-feedback-preview .wdc-controls {gap:10px;}
+      #wdc-feedback-preview .wdc-editor {padding:22px 16px;}
+    }
+    @media(pointer:coarse) {
+      #wdc-feedback-preview button,#wdc-feedback-preview select,#wdc-feedback-preview label.wdc-check {min-height:44px;}
+      #wdc-feedback-preview select {font-size:16px;}
+    }
+  </style>
+  <div class="wdc-heading"><strong>电脑操作提示</strong><span class="wdc-subtitle">模拟预览 · 不控制电脑</span></div>
+  <div class="wdc-controls">
+    <label>当前状态<select data-control="state" aria-label="模拟状态">
+      <option value="idle">空闲</option><option value="observing">正在观察</option><option value="clicking">点击中</option>
+      <option value="typing">输入中</option><option value="scrolling">滚动中</option><option value="operating">操作中</option><option value="waiting">等待界面响应</option><option value="stopping">正在停止</option>
+      <option value="stopped">已停止</option><option value="error">需要处理</option>
+    </select></label>
+    <label>提示位置<select data-control="position" aria-label="提示位置">
+      <option value="bottom-right">右下角</option><option value="bottom-left">左下角</option>
+      <option value="top-right">右上角</option><option value="top-left">左上角</option>
+    </select></label>
+    <label>不透明度 <output data-value="opacity">88%</output><input class="wdc-opacity" data-control="opacity" aria-label="不透明度" type="range" min="35" max="100" value="88"/></label>
+    <label class="wdc-check"><input data-control="enabled" type="checkbox" checked/>显示提示</label>
+    <button class="wdc-primary cursor-interaction" type="button" data-action="replay">模拟一次操作</button>
+  </div>
+  <div class="wdc-screen" data-screen>
+    <div class="wdc-app-title">测试编辑器 · 模拟桌面</div>
+    <div class="wdc-editor"><p>在此区域点击，可查看点击圆环。</p><p>空闲时只保留角落的小灰点。</p><div class="wdc-line"></div><div class="wdc-line"></div></div>
+    <button class="wdc-target cursor-interaction" type="button" data-action="target">测试按钮 · 0</button>
+    <div class="wdc-taskbar"><span class="wdc-task-dot"></span><span>任务栏预留区域</span></div>
+    <div class="wdc-overlay" data-overlay></div>
+  </div>
+  <div class="wdc-detail" data-detail role="status" aria-live="polite">当前：空闲 · 点击标记只表示事件位置，不代表操作成功</div>
+  <script type="module">
+    /*__VISUAL_FEEDBACK_SOURCE__*/
+
+    const root=document.getElementById('wdc-feedback-preview');
+    const screen=root.querySelector('[data-screen]');
+    const controls=Object.fromEntries(['state','position','opacity','enabled'].map(key=>[key,root.querySelector(`[data-control="${key}"]`)]));
+    const model=new VisualFeedback({settings:{enabled:true,reducedMotion:matchMedia('(prefers-reduced-motion: reduce)').matches}});
+    const view=mountFeedback(root.querySelector('[data-overlay]'),model);
+    const timers=new Set();
+    let targetCount=0;
+    function stopReplay(){for(const timer of timers)clearTimeout(timer);timers.clear();}
+    function later(delay,action){const timer=setTimeout(()=>{timers.delete(timer);action();},delay);timers.add(timer);}
+    function render(){
+      view.render();
+      controls.state.value=model.state;controls.position.value=model.settings.position;
+      controls.opacity.value=String(Math.round(model.settings.opacity*100));controls.enabled.checked=model.settings.enabled;
+      root.querySelector('[data-value="opacity"]').textContent=`${controls.opacity.value}%`;
+      root.querySelector('[data-detail]').textContent=`当前：${model.settings.enabled?FEEDBACK_STATES[model.state].label:'提示已隐藏'} · 点击标记只表示事件位置，不代表操作成功`;
+    }
+    function resize(){
+      const width=screen.clientWidth,height=screen.clientHeight;
+      if(width>0&&height>40){model.setViewport({x:0,y:0,width,height},{x:0,y:0,width,height:height-40});render();}
+    }
+    function save(){
+      if(window.openai?.setWidgetState)window.openai.setWidgetState({modelContent:{feature:'电脑操作提示',state:model.state,position:model.settings.position,opacity:model.settings.opacity,enabled:model.settings.enabled},privateContent:{settings:{...model.settings},state:model.state}}).catch(()=>{});
+    }
+    function restore(saved){
+      try{if(saved?.privateContent?.settings)model.configure(saved.privateContent.settings);if(saved?.privateContent?.state)model.setState(saved.privateContent.state);}catch{/* Older or incompatible saved settings are ignored. */}
+      render();
+    }
+    controls.state.addEventListener('change',()=>{stopReplay();model.setState(controls.state.value);render();save();});
+    controls.position.addEventListener('change',()=>{model.configure({position:controls.position.value});render();save();});
+    controls.opacity.addEventListener('input',()=>{model.configure({opacity:Number(controls.opacity.value)/100});render();});
+    controls.opacity.addEventListener('change',save);
+    controls.enabled.addEventListener('change',()=>{stopReplay();model.configure({enabled:controls.enabled.checked});render();save();});
+    screen.addEventListener('click',event=>{
+      stopReplay();const area=screen.getBoundingClientRect();
+      model.setState('clicking');model.recordClick(event.clientX-area.left-screen.clientLeft,event.clientY-area.top-screen.clientTop);
+      render();save();later(700,()=>{model.setState('idle');render();});
+    });
+    root.querySelector('[data-action="target"]').addEventListener('click',event=>{event.currentTarget.textContent=`测试按钮 · ${++targetCount}`;});
+    root.querySelector('[data-action="replay"]').addEventListener('click',()=>{
+      stopReplay();model.configure({enabled:true});model.setState('observing');render();
+      later(650,()=>{model.setState('clicking');model.recordClick(screen.clientWidth*0.48,screen.clientHeight*0.5);render();});
+      later(1350,()=>{model.setState('typing');render();});
+      later(2150,()=>{model.setState('waiting');render();});
+      later(3000,()=>{model.setState('idle');render();});
+      save();
+    });
+    const observer=new ResizeObserver(resize);observer.observe(screen);
+    restore(window.openai?.widgetState);resize();
+    window.addEventListener('openai:set_globals',event=>{if(event.detail?.globals?.widgetState)restore(event.detail.globals.widgetState);});
+    window.addEventListener('pagehide',()=>{stopReplay();observer.disconnect();view.destroy();},{once:true});
+  </script>
+</div>

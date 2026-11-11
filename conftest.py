@@ -1,0 +1,1 @@
+from test_support.desktop_sandbox import isolated_desktop

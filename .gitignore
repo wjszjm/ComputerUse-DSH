@@ -1,0 +1,45 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+
+# Runtime and local data
+.runtime/
+.build/
+shots/
+screenshots/
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.asar
+*.zip
+*.tgz
+*.whl
+
+# Local configuration and secrets
+.env
+.env.*
+config.json
+*credentials*
+*secret*
+*token*
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

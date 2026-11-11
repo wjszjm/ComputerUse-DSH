@@ -1,0 +1,27 @@
+{
+  "_comment": "ComputerUse-DSH 配置示例。复制到插件 cwd 指向的运行目录并命名为 config.json。",
+
+  "max_image_edge": 1280,
+  "default_grid": true,
+  "grid_step": 100,
+  "image_format": "png",
+  "jpeg_quality": 80,
+  "save_screenshots": false,
+  "screenshot_dir": "",
+
+  "allow_input": false,
+  "read_only": true,
+  "allow_shell": false,
+  "allow_launch": false,
+  "blocked_shortcuts": ["win+l", "ctrl+alt+delete", "ctrl+alt+del"],
+  "max_actions_per_second": 20,
+  "move_duration": 0.15,
+  "type_interval": 0.02,
+
+  "audit_log": false,
+  "audit_path": "",
+  "record_text_preview": false,
+  "record_images": false,
+
+  "server_name": "win-desktop-control"
+}
