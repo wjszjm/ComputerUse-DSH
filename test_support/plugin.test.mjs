@@ -19,7 +19,6 @@ const displayChildren = [];
 const scenarios = [];
 const touched = [];
 let deniedWritePath;
-let denyImages=false;
 function checked(file) {
   const target = path.resolve(String(file));
   assert.ok(target.startsWith(runtime + path.sep) || target === runtime, `Non-test filesystem path: ${target}`);
@@ -27,10 +26,10 @@ function checked(file) {
   return target;
 }
 mock.module('node:fs', {namedExports:Object.fromEntries(
-  ['mkdirSync','readdirSync','statSync','unlinkSync','writeFileSync'].map(name =>
+  ['mkdirSync','statSync','unlinkSync','writeFileSync'].map(name =>
     [name, (file,...args) => {
       const target=checked(file);
-      if(name==='writeFileSync' && (target===deniedWritePath || (denyImages && /shot-.*\.png$/.test(target)))) throw Object.assign(Error('mock access denied'),{code:'EACCES'});
+      if(name==='writeFileSync' && target===deniedWritePath) throw Object.assign(Error('mock access denied'),{code:'EACCES'});
       return fs[name](target,...args);
     }]))});
 mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
@@ -78,11 +77,13 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
   return child;
 }}});
 const {apply, McpBridge,annotateSchema,pruneSchema,buildDescription} = await import('../dsh-wdc-computer-use/lib/index.js');
+const imageRef={attachmentId:'attachment-test',mediaType:'image/png',bytes:68,width:1,height:1};
+const testAttachments={saveImage:async()=>imageRef};
 const options = {
   python:path.join(root,'.venv','Scripts','python.exe'),
   cwd:path.join(root,'win-desktop-control'),
   permissionMode:'autonomous',
-  shotDir:runtime, initTimeoutMs:1000, callTimeoutMs:1000,
+  initTimeoutMs:1000, callTimeoutMs:1000,
   stopFile:path.join(runtime,'stop.flag'),
 };
 
@@ -104,6 +105,7 @@ for (const [profile,count] of [['minimal',9],['standard',14],['full',17]]) {
     const ready = new Promise(resolve => {resolveReady=resolve;});
     const statusPath = path.join(runtime,`${profile}-status.json`);
     apply({logger:{warn(message) { if(message.includes('已注册')) resolveReady(); }},
+      get:name=>name==='attachments'?testAttachments:undefined,
       inject(deps,callback) { callback({tools:{register(tool) {
         registered.push({...tool,execute:(args,exec=mockExec)=>tool.execute(args,exec)}); return ()=>disposed.push(tool.name);
       }},effect(factory) { cleanups.push(factory()); }}); }
@@ -221,7 +223,8 @@ async function mounted(scenario,config={}) {
   const registered=[],cleanups=[],hooks=new Map(),commands=new Map();
   let ready, attachPresets;
   const done=new Promise(resolve=>{ready=resolve;});
-  const policy=apply({get:name=>({approval:config.testApproval,permissionPresets:config.testPresets})[name],
+  const policy=apply({get:name=>({approval:config.testApproval,permissionPresets:config.testPresets,
+    attachments:config.testAttachments===null?undefined:(config.testAttachments??testAttachments)})[name],
     on(name,handler){hooks.set(name,handler);},
     logger:{warn(message){if(message.includes('已注册'))ready();}},inject(deps,callback){
     if(deps.includes('permissionPresets')){
@@ -452,29 +455,38 @@ test('window verification failure remains a failure without replay or a success 
   }finally{b.close();}
 });
 
-// Stage 9: exercise the registered DSH execute/render boundary, not just the bridge.
-for (const mode of ['file','requested-direct','disk-error']) test(`DSH screenshot delivery ${mode}`,async()=>{
+for (const mode of ['native','unavailable','write-error','resized']) test(`DSH screenshot delivery ${mode}`,async()=>{
   const data='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jG1sAAAAASUVORK5CYII=';
-  scenarios.push({callResult:{content:[{type:'text',text:JSON.stringify({ok:true,frame_id:'frame-test'})},{type:'image',mimeType:'image/png',data}]}});
-  const registered=[],cleanups=[];let done;
-  const ready=new Promise(resolve=>{done=resolve;});
-  apply({logger:{warn(message){if(message.includes('已注册'))done();}},inject(deps,callback){callback({tools:{register(tool){registered.push({...tool,execute:(args,exec=mockExec)=>tool.execute(args,exec)});return ()=>{};}},effect(factory){cleanups.push(factory());}});}},
-    {...options,statusPath:path.join(runtime,`delivery-${mode}.json`),passImageContent:mode==='requested-direct'});
+  let saved;
+  const m=await mounted({callResult:{content:[{type:'text',text:JSON.stringify({ok:true,frame_id:'frame-test'})},{type:'image',mimeType:'image/png',data}]}},
+    {testAttachments:mode==='unavailable'?null:{async saveImage(input){
+      saved=input;
+      if(mode==='write-error')throw new Error('mock storage failure');
+      return mode==='resized'?{...imageRef,originalDimensions:{width:2,height:2}}:imageRef;
+    }}});
+  const before=children.length;
   try {
-    await ready;
-    const tool=registered.find(t=>t.name==='wdc_screenshot');
-    // Deny only generated image writes, keep the process and all other I/O mocked.
-    denyImages=mode==='disk-error';
+    const tool=m.tools.find(t=>t.name==='wdc_screenshot');
     const value=await tool.execute({});const rendered=tool.output.render({},value);
-    assert.equal(value.ok,mode!=='disk-error');
-    if(mode==='disk-error') assert.match(value.text,/image_delivery_failed/);
-    else {
-      const match=rendered[0].text.match(/\[截图已保存\] ([^\n]+)/);assert.ok(match,'DSH must receive a usable image reference');
-      assert.deepEqual(fs.readFileSync(match[1]),Buffer.from(data,'base64'));
-      assert.match(rendered[0].text,/frame-test/);
+    assert.equal(value.ok,mode==='native');
+    if(mode==='unavailable'){
+      assert.match(value.text,/image_delivery_unavailable/);
+      assert.equal(children.length,before);
+    }else{
+      assert.deepEqual(saved,{data:Buffer.from(data,'base64'),mediaType:'image/png'});
+      assert.equal(children.at(-1).requests.filter(q=>q.params?.name==='screenshot').length,1);
     }
-    assert.equal(children.at(-1).requests.filter(q=>q.params?.name==='screenshot').length,1);
-  } finally {denyImages=false;for(const cleanup of cleanups)cleanup();}
+    if(mode==='native'){
+      assert.match(rendered[0].text,/frame-test/);
+      assert.deepEqual(rendered[1],{type:'image',attachment:imageRef});
+      assert.deepEqual(tool.output.presentationMeta({},value),{wdc:{version:2,tool:'screenshot',imageIds:[imageRef.attachmentId]}});
+    }else{
+      assert.equal(rendered.length,1);
+      assert.doesNotMatch(value.text,/frame-test/);
+      if(mode==='write-error')assert.match(value.text,/image_delivery_failed/);
+      if(mode==='resized')assert.match(value.text,/image_resized/);
+    }
+  } finally {m.close();}
 });
 
 test('DSH bridge repeatable isolated measurement',async()=>{
@@ -854,18 +866,4 @@ test('approval timeout and unavailable context fail closed; unload aborts outsta
   await assert.rejects(policy.acquire('click',execution()),e=>e.code==='operation_cancelled');
   const pending=policy.acquire('click',execution());policy.close();
   await assert.rejects(pending,e=>e.code==='operation_cancelled');assert.equal(policy.active.size,0);
-});
-
-test('screenshot provenance survives host presentation without removing the model file reference',async()=>{
-  const m=await mounted({callResult:{content:[{type:'text',text:'{"ok":true,"frame_id":"private-test"}'},
-    {type:'image',mimeType:'image/png',data:Buffer.from('mock image bytes').toString('base64')}]}});
-  try{
-    const tool=m.tools.find(t=>t.name==='wdc_screenshot'),value=await tool.execute({});
-    assert.equal(value.ok,true);assert.equal(value.wdcScreenshots.length,1);
-    assert.ok(value.wdcScreenshots[0].startsWith(runtime));assert.ok(value.text.includes(value.wdcScreenshots[0]));
-    const meta=tool.output.presentationMeta({},value);
-    assert.deepEqual(meta,{wdc:{version:1,tool:'screenshot',screenshots:value.wdcScreenshots}});
-    assert.deepEqual(tool.output.render({},value),[{type:'text',text:value.text}]);
-    assert.equal(fs.existsSync(value.wdcScreenshots[0]),true);
-  }finally{m.close();}
 });

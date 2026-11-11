@@ -21,8 +21,7 @@
 ComputerUse-DSH/
 ├── dsh-wdc-computer-use/   # DSH Node 插件和浏览器客户端策略
 ├── win-desktop-control/    # Windows Python MCP 服务
-├── host-patch/             # DSH 0.2.2-rc.1 宿主补丁清单
-├── scripts/                # 客户端、工具清单和 ASAR 构建脚本
+├── scripts/                # 客户端和工具清单构建脚本
 ├── test_support/           # 隔离测试与桌面边界 Mock
 └── docs/                   # 架构、安装和隐私说明
 ```
@@ -34,11 +33,11 @@ ComputerUse-DSH/
 - Node.js 22.19 或更高版本
 - 已验证宿主：DSH 0.2.2-rc.1
 
-宿主补丁采用文件 SHA-256 和唯一文本锚点双重校验。DSH 更新后，如果任一宿主文件哈希变化，构建脚本会停止；请重新审计补丁，不能强行套用旧版本。
+从 1.1.0 起，安装和更新插件只涉及 DSH 用户 profile。DSH 更新替换 `app.asar` 时，插件通过宿主的工具、附件和客户端插槽接口重新加载。
 
 ## 安装
 
-当前提供面向熟悉 DSH profile 的手动安装方式。安装前请退出 DSH，并备份 DSH 的 `app.asar`、桌面 profile 的 `package.json` 和同名旧插件目录。
+当前提供面向熟悉 DSH profile 的手动安装方式。安装前请退出 DSH，并备份桌面 profile 的 `package.json` 和同名旧插件目录。
 
 ### 1. 安装 Python 服务
 
@@ -84,7 +83,6 @@ py -3 -m venv .venv
         cwd: 'C:\path\to\ComputerUse-DSH\.runtime'
         statusPath: 'C:\path\to\ComputerUse-DSH\.runtime\status.json'
         stopFile: 'C:\path\to\ComputerUse-DSH\.runtime\stop.flag'
-        shotDir: 'C:\path\to\ComputerUse-DSH\.runtime\shots'
         profile: standard
         permissionMode: ask
         feedbackEnabled: true
@@ -93,19 +91,9 @@ py -3 -m venv .venv
 
 不要把包含真实绝对路径的本机配置提交到公开仓库。
 
-### 3. 构建宿主补丁
+### 3. 启动与升级检查
 
-截图预览隐藏和完成后工具详情收起依赖版本绑定的宿主补丁。构建脚本只在指定输出位置生成候选，不会自动覆盖正式 DSH：
-
-```powershell
-.\.venv\Scripts\python.exe .\scripts\build-candidate-asar.py `
-  --source-asar 'C:\path\to\DSH\resources\app.asar' `
-  --manifest '.\host-patch\manifest.json' `
-  --output '.\.build\app.candidate.asar' `
-  --backup '.\.build\app.original.asar'
-```
-
-核对脚本输出和备份哈希后，由你在 DSH 完全退出时替换正式 `app.asar`。完整步骤和回退边界见 [安装说明](docs/INSTALL.md)。
+启动 DSH 后检查插件是否启用，以及“＋”菜单是否有“电脑操作”。旧版已修改的 `app.asar` 可由 DSH 官方更新替换。安装步骤、版本要求和旧截图的显示边界见 [安装说明](docs/INSTALL.md)。
 
 ## 权限与隐私
 
@@ -122,7 +110,7 @@ py -3 -m venv .venv
 
 - 模型参数不能自行提高权限。
 - `run_command` 默认不注册，Python 的 `allow_shell` 默认应保持关闭。
-- 截图只保存到明确配置的本地目录，不应提交到 Git。
+- 截图保存在 DSH 的会话附件存储中，聊天画廊按来源隐藏插件截图。所选模型服务可能收到图片。
 - 状态提示只接收固定状态和坐标，不接收输入文字、截图内容或任意工具结果。
 - 任何截图、日志、会话、账号、Cookie、令牌、用户目录和绝对路径都不属于本仓库内容。
 
@@ -146,7 +134,7 @@ npm test
 
 ## 已知限制
 
-- 宿主补丁只绑定已验证的 DSH 0.2.2-rc.1。
+- 截图要求 DSH 提供原生附件服务，所选模型支持图像输入。将来的 DSH 如果更改插件接口，需要更新对应适配。
 - 多显示器、混合 DPI、不同截图后端和长时间资源占用需要在目标机器继续验证。
 - 提示窗口的截图排除依赖 Windows 和捕获后端能力；系统标志成功不代表每个第三方捕获程序都会忽略它。
 - 当前没有自动安装器；手动安装错误可能导致 DSH 无法启动，请务必保留回退文件。

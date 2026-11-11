@@ -19,6 +19,6 @@ The Node plugin registers a static, versioned tool catalog without starting Pyth
 
 DSH runs its pre-execution gate before invoking the tool body. For Auto, the plugin records the host preset against the host execution object and uses it only when the same execution arrives at the body with unchanged session permissions. Manual approvals are kept separately for observation and control in the live session object. Host preset, sandbox, and approval policy events invalidate grants and abort leases. The `wdc-access` slash command is registered with DSH's direct user command service.
 
-The browser client adds a draft-level “computer use” intent, hides terminal desktop-tool details, and filters screenshot presentation using persisted provenance. The model-facing local file reference remains available for image reading.
+DSH stores each capture as a native image attachment and delivers it with frame metadata to the model. The browser client registers the draft-level “computer use” action, uses keyed tool views for normal desktop-tool calls, and filters chat galleries using attachment IDs persisted in tool presentation metadata. DSH can still show its own permission and automatic review messages.
 
 The native feedback host is separately opted in. It receives fixed operation states and screen points only. It is created during a tool call and closed after the last active call.

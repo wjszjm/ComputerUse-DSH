@@ -2,7 +2,7 @@
 
 ComputerUse-DSH runs locally. It does not add a Codex connection, analytics service, cloud storage service, or telemetry endpoint.
 
-Desktop screenshots can contain sensitive information. The Node plugin writes them to the configured local `shotDir` when DSH needs a file reference. Keep the directory outside version control and protect it according to your local machine policy. DSH may send images that the model reads to your configured model provider. Old files matching the plugin's screenshot naming pattern are eligible for age-based cleanup.
+Desktop screenshots can contain sensitive information. DSH stores screenshots in its local attachment store and can send them to your configured model provider. Hiding previews is a presentation setting. Stored attachments follow DSH's data handling and retention behavior.
 
 The visual feedback layer receives only a bounded status name and screen coordinates. It does not receive typed text, screenshot pixels, clipboard contents, arbitrary tool arguments, or raw tool results.
 

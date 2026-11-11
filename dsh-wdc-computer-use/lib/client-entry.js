@@ -7,6 +7,7 @@ export function apply(ctx,config={}) {
   const target='wdc-private-images';
   ctx.uiConversation.events.register({kind:target,target,
     match:event=>event.type==='tool/result'&&(event.data.meta?.wdc?.version===1||
+      (event.data.meta?.wdc?.version===2&&event.data.meta.wdc.tool==='screenshot')||
       (typeof event.data.meta?.path==='string'&&event.data.message?.content?.some(item=>item.type==='image')))?{id:String(event.seq),role:'start'}:null,
     start:(_context,match)=>({meta:match.event.data.meta,message:{content:(match.event.data.message?.content??[])
       .filter(item=>item.type==='image').map(item=>({type:'image',attachment:{attachmentId:item.attachment?.attachmentId}}))}}),update:context=>context.state,
@@ -38,7 +39,7 @@ export function apply(ctx,config={}) {
     }
     return cached;
   }
-  // Version-pinned host adapters consult this before constructing any image/card.
+  // Keep legacy patched installations working during migration.
   const key=Symbol.for('dsh.wdc.ui-policy.v1');
   if(globalThis[key])throw new Error('A WDC client policy is already mounted');
   const policy={hiddenPath:value=>index().paths.has(canonicalPath(value)),
@@ -54,6 +55,12 @@ export function apply(ctx,config={}) {
       const binding=ctx.sessions.binding(session.sessionId);
       if(binding)toggleIntent(ctx.conversation.input.for(binding.ctx));
     }}});
+  ctx.slots.inject('tool.call.toolview',()=>{
+    for(const name of names){
+      ctx.slots.register({name:'tool.call.toolview',key:name,priority:1000},
+        props=>props.phase==='start'?'电脑操作调用中':null);
+    }
+  });
   for(const name of ['conversation.chat.message.images','conversation.chat.user.images','conversation.trajectory.images','tool.call.images']){
     ctx.slots.inject(name,()=>ctx.slots.register({name,priority:1000,
       inject:id=>({hooks:{wdcRecords:recordsFor(id)}})},function Images(props){

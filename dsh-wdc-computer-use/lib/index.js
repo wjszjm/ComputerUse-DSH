@@ -11,13 +11,13 @@
  *
  * 设计约束：
  *   - 任何一步失败都不能让 DSH 启动失败：全部 try/catch，失败只记日志、不抛异常
- *   - 截图默认落盘为 PNG 并返回路径（DSH 工具结果的图片直通未经验证，避免冒险）
+ *   - 截图通过 DSH 原生附件交给模型，保留工具坐标对应的图像尺寸
  *   - 子进程随插件卸载而关闭
  */
 
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {FeedbackSession,summarizeFeedbackResult} from './feedback-session.js';
 import {NativeFeedbackHost} from './native-feedback-host.js';
@@ -87,10 +87,6 @@ const DEFAULTS = {
   permissionMode: 'ask',
   rememberSessionApprovals: true,
   approvalTimeoutMs: 60000,
-  /** 截图落盘目录，留空则用系统临时目录下的 wdc-shots */
-  shotDir: '',
-  /** 兼容旧配置；DSH 图片直通未验证，当前统一返回可读取的图片路径。 */
-  passImageContent: false,
   /** 不注册的工具名（服务端工具名，非 wdc_ 前缀名），用于给上下文减负 */
   hideTools: DEFAULT_HIDDEN,
   /** 是否精简 schema（去 title / 空默认值 / 截断超长描述） */
@@ -100,34 +96,6 @@ const DEFAULTS = {
 };
 
 const PROTOCOL_VERSION = '2024-11-05';
-
-/**
- * 清理截图目录里的历史文件。
- *
- * 每张截图都会落盘，长任务一轮七八张，不清理会累积成上百 MB 的垃圾。
- * 只删本插件自己写的 shot-*.png/jpg，不碰目录里的其他东西。
- */
-function cleanOldShots(dir, maxAgeMs = 24 * 60 * 60 * 1000) {
-  let removed = 0;
-  try {
-    const now = Date.now();
-    for (const name of readdirSync(dir)) {
-      if (!/^shot-\d+-\d+\.(png|jpg|jpeg|webp)$/i.test(name)) continue;
-      const file = path.join(dir, name);
-      try {
-        if (now - statSync(file).mtimeMs > maxAgeMs) {
-          unlinkSync(file);
-          removed += 1;
-        }
-      } catch {
-        /* 单个文件删不掉不影响其余 */
-      }
-    }
-  } catch {
-    /* 目录不存在或不可读，忽略 */
-  }
-  return removed;
-}
 
 /**
  * 精简 JSON Schema，压掉纯冗余。
@@ -314,7 +282,6 @@ class McpBridge {
     this.controlVersion = 0;
     this.inDoubt = new Map();
     this.closed = false;
-    this.shotIndex = 0;
     /** 服务端在 initialize 响应里下发的使用指引（标准循环 / 坐标规则 / 安全约束） */
     this.instructions = '';
     try {
@@ -480,8 +447,6 @@ class McpBridge {
           if (this.closed || this.child !== child) throw bridgeError('bridge_closed', '握手期间服务已关闭');
           this.ready = true;
           this.log(`握手成功：${JSON.stringify(result?.serverInfo ?? {})}，instructions ${this.instructions.length} 字符`);
-          const removed = cleanOldShots(this.shotDirectory());
-          if (removed > 0) this.log(`清理 24 小时前的历史截图 ${removed} 张`);
           this.feedbackInvoke('setTransportAvailable',true);
           this.refreshFeedbackControl();
           this.runtimeState(this.activeCalls ? 'active' : 'idle');
@@ -751,34 +716,6 @@ class McpBridge {
     return task;
   }
 
-  /** 截图落盘目录：优先用配置值，未配置则放在项目目录下的 shots/，方便查看与清理 */
-  shotDirectory() {
-    if (this.options.shotDir) return this.options.shotDir;
-    return path.join(this.options.cwd, 'shots');
-  }
-
-  /** 把 MCP 的 image content 落盘，返回文件绝对路径 */
-  saveImage(item) {
-    const base64 = typeof item?.data === 'string' ? item.data : '';
-    if (!base64) return null;
-    const dir = this.shotDirectory();
-    try {
-      mkdirSync(dir, { recursive: true });
-    } catch {
-      return null;
-    }
-    const mime = typeof item?.mimeType === 'string' ? item.mimeType : 'image/png';
-    const ext = mime.includes('jpeg') ? '.jpg' : mime.includes('webp') ? '.webp' : '.png';
-    this.shotIndex += 1;
-    const file = path.join(dir, `shot-${Date.now()}-${this.shotIndex}${ext}`);
-    try {
-      writeFileSync(file, Buffer.from(base64, 'base64'));
-      return file;
-    } catch {
-      return null;
-    }
-  }
-
   close() {
     this.closed = true;
     this.cancelIdle();
@@ -788,7 +725,7 @@ class McpBridge {
 }
 
 /** 把 MCP 返回的 content 数组转成 DSH 工具结果 */
-function toHostContent(result, bridge) {
+async function toHostContent(result, attachments) {
   const items = Array.isArray(result?.content) ? result.content : [];
   const parts = [];
   for (const item of items) {
@@ -798,17 +735,19 @@ function toHostContent(result, bridge) {
       continue;
     }
     if (item.type === 'image') {
-      // DSH currently renders text-only tool output. Always supply a file reference
-      // until its native image contract has been validated end to end.
-      const file = bridge.saveImage(item);
-      if (!file) throw bridgeError('image_delivery_failed', '截图未能交付给 DSH；请检查截图目录权限后重新观察。');
-      parts.push({
-        type: 'text',
-        wdcScreenshotPath: file,
-        text: file
-          ? `[截图已保存] ${file}\n（用文件读取工具打开该 PNG 查看；坐标按图片像素给出，服务端会自动换算成屏幕坐标）`
-          : '[截图已生成，但落盘失败；请检查临时目录权限]',
-      });
+      let attachment;
+      try {
+        const data = Buffer.from(item.data, 'base64');
+        attachment = await attachments.saveImage({data, mediaType: item.mimeType});
+        if (!attachment?.attachmentId || !attachment.width || !attachment.height) throw new Error('Invalid image reference');
+      } catch {
+        throw bridgeError('image_delivery_failed', 'DSH 未能接收截图。请检查附件服务，或缩小截图区域后重试。');
+      }
+      const original = attachment.originalDimensions;
+      if (original && (original.width !== attachment.width || original.height !== attachment.height)) {
+        throw bridgeError('image_resized', 'DSH 缩放了截图，图像坐标已失效。请用较小的区域或 scale 重新截图。');
+      }
+      parts.push({type:'image', attachment});
       continue;
     }
     parts.push({ type: 'text', text: JSON.stringify(item) });
@@ -971,6 +910,7 @@ export function apply(ctx, config) {
           : TOOL_PROFILES.standard;
         const allowSet = allowed ? new Set(allowed) : null;
         let skipped = 0;
+        const failedTools = [];
         for (const tool of list) {
           if (!CONTROL_TOOLS.has(tool.name) && (hidden.has(tool.name) || (allowSet && !allowSet.has(tool.name)))) {
             skipped += 1;
@@ -999,13 +939,13 @@ export function apply(ctx, config) {
               output: {
                 schema: OUTPUT_SCHEMA,
                 presentationMeta(_args,value) {
-                  return {wdc:{version:1,tool:tool.name,screenshots:value?.wdcScreenshots ?? []}};
+                  return {wdc:{version:2,tool:tool.name,imageIds:(value?.images ?? []).map(item => item.attachment.attachmentId)}};
                 },
                 render(_args, value) {
                   const text = value && typeof value === 'object' && typeof value.text === 'string'
                     ? value.text
                     : JSON.stringify(value ?? null);
-                  return [{ type: 'text', text }];
+                  return [{ type: 'text', text }, ...(value?.images ?? [])];
                 },
               },
               async execute(args,exec) {
@@ -1023,6 +963,11 @@ export function apply(ctx, config) {
                 executions += 1;
                 try {
                 // Stop is local and immediate, even while Python/display is starting.
+                const attachments = toolsCtx.get?.('attachments') ?? ctx.get?.('attachments');
+                if (tool.name === 'screenshot' && typeof attachments?.saveImage !== 'function') {
+                  return {ok:false,text:JSON.stringify({ok:false,error_code:'image_delivery_unavailable',
+                    error:'此 DSH 未提供原生附件服务，暂无法交付截图。'})};
+                }
                 if (tool.name !== 'stop') await startDisplay();
                 let result;
                 try { lease?.check();result = await bridge.callTool(tool.name, input,true,lease); }
@@ -1030,14 +975,16 @@ export function apply(ctx, config) {
                   return {ok:false,text:JSON.stringify({ok:false,action:tool.name,error_code:error.code || 'bridge_error',error:error.message})};
                 }
                 let content;
-                try { content = toHostContent(result, bridge); }
+                try { content = await toHostContent(result, attachments); lease?.check(); }
                 catch (error) {
+                  if (tool.name === 'screenshot') bridge.needsFreshFrame = true;
                   return {ok:false,text:JSON.stringify({ok:false,action:tool.name,error_code:error.code || 'result_conversion_failed',error:error.message})};
                 }
                 const text = content
-                  .map((item) => (item.type === 'text' ? item.text : `[图片 ${item.mimeType}]`))
+                  .filter(item => item.type === 'text')
+                  .map(item => item.text)
                   .join('\n');
-                return { ok: toolSucceeded(result), text, wdcScreenshots:content.flatMap(item=>item.wdcScreenshotPath?[item.wdcScreenshotPath]:[]) };
+                return {ok:toolSucceeded(result), text, images:content.filter(item => item.type === 'image')};
                 } finally {
                   lease?.release();
                   executions -= 1;
@@ -1048,16 +995,18 @@ export function apply(ctx, config) {
             if (typeof dispose === 'function') disposers.push(dispose);
             manifest.push({ name: hostName, source: tool.name });
           } catch (error) {
+            failedTools.push(hostName);
             log(`注册工具 ${hostName} 失败：${error instanceof Error ? error.message : String(error)}`);
           }
         }
-        log(`已注册 ${disposers.length} 个工具${skipped ? `（另有 ${skipped} 个按配置隐藏）` : ''}`);
+        log(`已注册 ${manifest.length} 个工具${skipped ? `（另有 ${skipped} 个按配置隐藏）` : ''}`);
         reportStatus({
-          ok: true,
-          stage: 'registered',
+          ok: failedTools.length === 0,
+          stage: failedTools.length === 0 ? 'registered' : 'registration-incomplete',
           note: '工具已注册；服务按调用启动，空闲时静默并回收',
           runtime: {state:'dormant',activeCalls:0,stopped:bridge.isStopped()},
-          registered: disposers.length,
+          registered: manifest.length,
+          failedTools,
           profile: profileName,
           tools: manifest.map((entry) => entry.name),
           instructionsChars: bridge.instructions.length,
