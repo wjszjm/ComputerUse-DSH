@@ -93,7 +93,8 @@ export class SessionPermissions {
     }
     const mode = rawInput.trim();
     if (mode === '') {
-      return {kind:'success', text:`电脑操作模式：${this.state(session).mode}。可用命令：/wdc-access ask、read-only、disabled、revoke。`};
+      const {preset} = this.hostAccess(session);
+      return {kind:'success', text:`电脑操作模式：${this.state(session).mode}。DSH 当前预设：${preset ?? '不可用'}。可用命令：/wdc-access ask、read-only、disabled、revoke、stop。`};
     }
     if (mode === 'revoke') {
       this.revoke(session);

@@ -219,11 +219,15 @@ test('close and failed handshake reject pending work and clear timers', async ()
 async function mounted(scenario,config={}) {
   scenarios.push(scenario);
   const registered=[],cleanups=[],hooks=new Map(),commands=new Map();
-  let ready;
+  let ready, attachPresets;
   const done=new Promise(resolve=>{ready=resolve;});
   const policy=apply({get:name=>({approval:config.testApproval,permissionPresets:config.testPresets})[name],
     on(name,handler){hooks.set(name,handler);},
     logger:{warn(message){if(message.includes('已注册'))ready();}},inject(deps,callback){
+    if(deps.includes('permissionPresets')){
+      attachPresets=service=>callback({permissionPresets:service,effect:factory=>cleanups.push(factory())});
+      return;
+    }
     if(deps.includes('commands')){
       callback({commands:{register(command){commands.set(command.name,command);}}});
       return;
@@ -232,7 +236,7 @@ async function mounted(scenario,config={}) {
   }},{...options,stopFile:path.join(runtime,`mount-${++caseId}.flag`),statusPath:path.join(runtime,`mount-${caseId}.json`),...config});
   await done;
   assert.equal(typeof policy,'function','Cordis apply must return an effect disposer');
-  return {tools:registered,policy:policy.permissions,hooks,commands,close(){for(const cleanup of cleanups)cleanup();policy();}};
+  return {tools:registered,policy:policy.permissions,hooks,commands,attachPresets,close(){for(const cleanup of cleanups)cleanup();policy();}};
 }
 
 test('host sees legacy business errors as failures and safety controls cannot be hidden', async () => {
@@ -655,6 +659,26 @@ test('older hosts without presets still ask per call before startup',async()=>{
     assert.equal((await tool.execute({x:1,y:2},exec)).ok,false);
     assert.equal(children.at(-1).requests.filter(r=>r.params?.name==='click').length,1);assert.equal(requests,2);
   }finally{m.close();}
+});
+
+test('preset service may become available after the desktop tools register',async()=>{
+  let requests=0;
+  const m=await mounted({}, {permissionMode:'ask',
+    testApproval:{request:async()=>{requests++;return 'allowed-once';}},
+  });
+  const session={};
+  const tool=m.tools.find(t=>t.name==='wdc_wait');
+  const run=()=>tool.execute({ms:1},execution(tool.name,session));
+  try {
+    assert.equal((await run()).ok,true);
+    assert.equal((await run()).ok,true);
+    m.attachPresets({current:()=> 'workspace-write'});
+    assert.equal((await run()).ok,true);
+    assert.equal((await run()).ok,true);
+    assert.equal(requests,3);
+    const result=await m.commands.get('wdc-access').handler({agent:{session},rawInput:''});
+    assert.match(result.text,/DSH 当前预设：workspace-write/);
+  } finally {m.close();}
 });
 
 test('manual approvals remember separate observation and control grants in one session',async()=>{

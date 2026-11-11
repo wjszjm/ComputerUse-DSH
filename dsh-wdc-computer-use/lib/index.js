@@ -858,7 +858,8 @@ export function apply(ctx, config) {
     }
   };
 
-  const getPresets = () => ctx.get?.('permissionPresets');
+  let injectedPresets;
+  const getPresets = () => injectedPresets ?? ctx.get?.('permissionPresets');
   const permissions = new SessionPermissions({
     mode:options.permissionMode,
     timeoutMs:options.approvalTimeoutMs,
@@ -890,10 +891,33 @@ export function apply(ctx, config) {
   function reportStatus(update){
     if(statusClosed)return;
     statusPayload={...statusPayload,...update};
-    writeStatus(statusPath,{...statusPayload,nativeFeedback:nativeDisplay.status()});
+    writeStatus(statusPath,{
+      ...statusPayload,
+      nativeFeedback:nativeDisplay.status(),
+      permissionIntegration:{
+        hostPresetsAvailable:typeof getPresets()?.current === 'function',
+        directCommandsAvailable:typeof ctx.get?.('commands')?.register === 'function',
+      },
+    });
   }
 
   reportStatus({});
+
+  // Optional host service. Tools may register before the preset service starts.
+  ctx.inject(['permissionPresets'], (presetCtx) => {
+    const service = presetCtx.permissionPresets;
+    if (typeof service?.current !== 'function') return;
+    presetCtx.effect(() => {
+      injectedPresets = service;
+      reportStatus({});
+      return () => {
+        if (injectedPresets === service) {
+          injectedPresets = undefined;
+          reportStatus({});
+        }
+      };
+    });
+  });
 
   ctx.on?.('session/event', (session, event) => permissions.onSessionEvent(session, event));
   ctx.on?.('tools/pre-execute', (exec, next) => {
@@ -1037,10 +1061,6 @@ export function apply(ctx, config) {
           profile: profileName,
           tools: manifest.map((entry) => entry.name),
           instructionsChars: bridge.instructions.length,
-          permissionIntegration: {
-            hostPresetsAvailable: typeof getPresets()?.current === 'function',
-            directCommandsAvailable: typeof ctx.get?.('commands')?.register === 'function',
-          },
           python: options.python,
           cwd: options.cwd,
         });
