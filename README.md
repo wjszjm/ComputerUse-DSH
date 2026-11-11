@@ -1,6 +1,6 @@
 # ComputerUse-DSH
 
-面向 DeepSeek Harness 的 Windows Computer Use 插件。它让 DSH Agent 通过标准 MCP 调用完成截图、鼠标、键盘、窗口和剪贴板操作，同时提供按次授权、紧急停止、空闲回收和操作位置提示。DSH 安装标识为 `dsh-wdc-computer-use`，便于更新已安装的副本。
+面向 DeepSeek Harness 的 Windows Computer Use 插件。它让 DSH Agent 通过标准 MCP 调用完成截图、鼠标、键盘、窗口和剪贴板操作，同时提供会话授权、紧急停止、空闲回收和操作位置提示。DSH 安装标识为 `dsh-wdc-computer-use`，便于更新已安装的副本。
 
 > This repository provides a Windows Computer Use integration for DeepSeek Harness. The documentation is Chinese-first; issues and pull requests in English are welcome.
 
@@ -9,7 +9,7 @@
 - Python MCP 服务提供 18 个底层工具；DSH 标准档默认注册 14 个工具。
 - 支持截图、屏幕信息、点击、输入、按键、滚动、窗口枚举与控制、剪贴板读取、等待、停止和恢复。
 - 首次工具调用时才启动 Python 服务，空闲 60 秒后自动回收。
-- 默认按次申请 DSH 权限；拒绝、取消或超时后不会启动截图或输入服务。
+- 首次授权后在当前会话记住同类电脑操作权限。DSH 自动权限审查放行后直接执行。
 - 工具调用期间显示状态提示；输入动作可显示代理当前位置的小黑色箭头，提示层不抢焦点并尝试从截图中排除。
 - DSH “＋”菜单可选择或取消本次草稿的“电脑操作”意图。
 - 聊天中不展示桌面截图预览，但模型内部仍能读取截图用于定位。
@@ -110,7 +110,17 @@ py -3 -m venv .venv
 
 ## 权限与隐私
 
-- 默认 `permissionMode: ask`，每次调用由 DSH 发起授权。
+默认 `permissionMode: ask`。在支持权限预设的 DSH 中，首次观察与首次输入各询问一次。观察包括截图、屏幕和窗口查询、剪贴板读取与等待。输入和控制包括点击、键盘、滚动和窗口操作。授权只记在当前会话内存中，切换预设、撤销、停止或卸载插件后清除相应授权。显式开启的应用启动与 shell 在人工审批模式下逐次询问。
+
+| DSH 当前预设 | 插件行为 |
+| --- | --- |
+| 自动权限审查 | 由宿主执行审查，按宿主放行、拒绝或转人工审批的结果执行。 |
+| 完全权限 | 确认宿主处于完全权限预设后，插件直接执行。 |
+| 工作区内修改 | 首次观察、首次输入与控制分别申请授权。 |
+| 自定义 | 遵循宿主只读和审批策略。允许询问时按会话记住同类授权。 |
+
+在 DSH 输入框中提交 `/wdc-access revoke` 可撤销插件授权并取消在途操作。用 `/wdc-access read-only` 禁止输入，用 `/wdc-access disabled` 禁止新的电脑操作，用 `/wdc-access stop` 紧急停止。用 `/wdc-access ask` 恢复默认授权流程，宿主预设仍然生效。切换宿主预设也会撤销已记住的插件授权。较旧的宿主缺少权限预设服务时保留逐次审批。将 `rememberSessionApprovals` 设为 `false` 也可保留逐次审批。
+
 - 模型参数不能自行提高权限。
 - `run_command` 默认不注册，Python 的 `allow_shell` 默认应保持关闭。
 - 截图只保存到明确配置的本地目录，不应提交到 Git。

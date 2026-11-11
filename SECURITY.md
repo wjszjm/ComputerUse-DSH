@@ -12,7 +12,8 @@ Please include the affected component, impact, reproduction prerequisites, and t
 
 ## Security defaults
 
-- Use `permissionMode: ask` unless a trusted host explicitly grants autonomous use.
+- Use `permissionMode: ask` to follow the DSH permission preset and request explicit observation or control grants in manual mode. Set `rememberSessionApprovals: false` to request manual approval per call.
+- Run `/wdc-access revoke` to clear the session's plugin grants. Run `/wdc-access disabled` to block further desktop operations in that session.
 - Keep `allow_shell` and `allow_launch` disabled unless the deployment requires them.
 - Start with `read_only: true` and `allow_input: false` during installation checks.
 - Store screenshots and runtime files outside the repository.

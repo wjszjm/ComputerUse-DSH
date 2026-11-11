@@ -218,15 +218,21 @@ test('close and failed handshake reject pending work and clear timers', async ()
 
 async function mounted(scenario,config={}) {
   scenarios.push(scenario);
-  const registered=[],cleanups=[];
+  const registered=[],cleanups=[],hooks=new Map(),commands=new Map();
   let ready;
   const done=new Promise(resolve=>{ready=resolve;});
-  const policy=apply({get:()=>config.testApproval,logger:{warn(message){if(message.includes('已注册'))ready();}},inject(deps,callback){
+  const policy=apply({get:name=>({approval:config.testApproval,permissionPresets:config.testPresets})[name],
+    on(name,handler){hooks.set(name,handler);},
+    logger:{warn(message){if(message.includes('已注册'))ready();}},inject(deps,callback){
+    if(deps.includes('commands')){
+      callback({commands:{register(command){commands.set(command.name,command);}}});
+      return;
+    }
     callback({tools:{register(tool){registered.push({...tool,execute:(args,exec=mockExec)=>tool.execute(args,exec)}); return ()=>{};}},effect(factory){cleanups.push(factory());}});
   }},{...options,stopFile:path.join(runtime,`mount-${++caseId}.flag`),statusPath:path.join(runtime,`mount-${caseId}.json`),...config});
   await done;
   assert.equal(typeof policy,'function','Cordis apply must return an effect disposer');
-  return {tools:registered,policy:policy.permissions,close(){for(const cleanup of cleanups)cleanup();policy();}};
+  return {tools:registered,policy:policy.permissions,hooks,commands,close(){for(const cleanup of cleanups)cleanup();policy();}};
 }
 
 test('host sees legacy business errors as failures and safety controls cannot be hidden', async () => {
@@ -627,7 +633,7 @@ test('pointer events bind live request, ignore stale children/sequences, and van
 
 
 const execution=(name='wdc_click',session={})=>({name,agent:{session},callId:'permission-test',signal:new AbortController().signal});
-for(const answer of ['rejected','cancelled','unavailable'])test(`approval ${answer} has zero worker/display side effects`,async()=>{
+for(const answer of ['rejected','cancelled','unavailable','unknown'])test(`approval ${answer} has zero worker/display side effects`,async()=>{
   const before=children.length,displays=displayChildren.length;
   const m=await mounted({}, {permissionMode:'ask',feedbackEnabled:true,feedbackNativeEnabled:true,testApproval:{request:async()=>answer}});
   try{
@@ -636,7 +642,7 @@ for(const answer of ['rejected','cancelled','unavailable'])test(`approval ${answ
   }finally{m.close();scenarios.pop();}
 });
 
-test('each approval grants one call only and is requested before startup',async()=>{
+test('older hosts without presets still ask per call before startup',async()=>{
   let requests=0;const before=children.length;
   const m=await mounted({}, {permissionMode:'ask',testApproval:{request:async req=>{
     requests++;assert.equal(req.toolName,'wdc_click');assert.equal(req.callId,'permission-test');
@@ -649,6 +655,123 @@ test('each approval grants one call only and is requested before startup',async(
     assert.equal((await tool.execute({x:1,y:2},exec)).ok,false);
     assert.equal(children.at(-1).requests.filter(r=>r.params?.name==='click').length,1);assert.equal(requests,2);
   }finally{m.close();}
+});
+
+test('manual approvals remember separate observation and control grants in one session',async()=>{
+  const requested=[];
+  const m=await mounted({}, {permissionMode:'ask',
+    testPresets:{current:()=> 'workspace-write'},
+    testApproval:{request:async request=>{requested.push(request);return 'allowed-once';}},
+  });
+  const session={};
+  const call=(name,args={},target=session)=>m.tools.find(t=>t.name===name).execute(args,execution(name,target));
+  try {
+    for(let i=0;i<5;i++) assert.equal((await call('wdc_wait',{ms:1})).ok,true);
+    for(let i=0;i<2;i++) assert.equal((await call('wdc_click',{x:1,y:2})).ok,true);
+    assert.deepEqual(requested.map(r=>r.toolName),['wdc_wait','wdc_click']);
+    assert.ok(requested.every(r=>r.reason.includes('本会话')));
+    assert.equal((await call('wdc_wait',{ms:1},{})).ok,true);
+    assert.equal(requested.length,3);
+    const command=m.commands.get('wdc-access');
+    assert.ok(command);
+    assert.ok(!m.tools.some(tool=>tool.name.includes('access')));
+    assert.equal((await command.handler({agent:{session},rawInput:'revoke'})).kind,'success');
+    assert.equal((await call('wdc_wait',{ms:1})).ok,true);
+    assert.equal(requested.length,4);
+    m.hooks.get('session/event')(session,{type:'permission/preset'});
+    assert.equal((await call('wdc_wait',{ms:1})).ok,true);
+    assert.equal(requested.length,5);
+  } finally {m.close();}
+});
+
+test('concurrent observation approvals share one prompt and revocation aborts all callers',async()=>{
+  const {SessionPermissions}=await import('../dsh-wdc-computer-use/lib/permissions.js');
+  let requests=0, resolveApproval;
+  const policy=new SessionPermissions({
+    getPresets:()=>({current:()=> 'custom'}),
+    getApproval:()=>({request:()=>{requests++;return new Promise(resolve=>{resolveApproval=resolve;});}}),
+  });
+  const session={};
+  const first=policy.acquire('screenshot',execution('wdc_screenshot',session));
+  const second=policy.acquire('list_windows',execution('wdc_list_windows',session));
+  const pending=Promise.allSettled([first,second]);
+  await tick();
+  assert.equal(requests,1);
+  policy.setMode(session,'disabled');
+  resolveApproval('allowed-once');
+  for(const result of await pending) assert.equal(result.reason?.code,'operation_cancelled');
+  assert.equal(policy.state(session).grants.size,0);
+  assert.equal(policy.active.size,0);
+  policy.close();
+});
+
+test('Auto reuses the DSH pre-execute gate and cannot grant a direct call',async()=>{
+  let requests=0, preset='auto';
+  const m=await mounted({}, {permissionMode:'ask',
+    testPresets:{current:()=>preset,names:['auto','workspace-write']},
+    testApproval:{request:async()=>{requests++;return 'rejected';}},
+  });
+  try {
+    const tool=m.tools.find(t=>t.name==='wdc_wait');
+    const prepare=m.hooks.get('tools/pre-execute');
+    const session={};
+    const allowed=execution(tool.name,session);
+    assert.deepEqual(await prepare(allowed,async()=>({kind:'allow'})),{kind:'allow'});
+    assert.equal((await tool.execute({ms:1},allowed)).ok,true);
+    const denied=execution(tool.name,session);
+    assert.deepEqual(await prepare(denied,async()=>({kind:'deny'})),{kind:'deny'});
+    assert.equal(requests,0);
+    const stale=execution(tool.name,session);
+    await prepare(stale,async()=>({kind:'allow'}));
+    preset='workspace-write';
+    m.hooks.get('session/event')(session,{type:'permission/preset'});
+    preset='auto';
+    assert.match((await tool.execute({ms:1},stale)).text,/permission_revoked/);
+    assert.equal(requests,0);
+    assert.equal((await tool.execute({ms:1},execution(tool.name,session))).ok,false);
+    assert.equal(requests,1);
+  } finally {m.close();}
+});
+
+test('full access accepts the verified preset and respects user-only restrictions and stop',async()=>{
+  let preset='danger-full-access', sandbox='danger-full-access', requests=0;
+  const m=await mounted({}, {permissionMode:'ask',
+    testPresets:{current:()=>preset,permissionState:()=>({sandbox})},
+    testApproval:{effectivePolicy:()=> 'never',request:async()=>{requests++;return 'rejected';}},
+  });
+  const session={};
+  const call=(name,args={})=>m.tools.find(t=>t.name===name).execute(args,execution(name,session));
+  const command=rawInput=>m.commands.get('wdc-access').handler({agent:{session},rawInput});
+  try {
+    assert.equal((await call('wdc_wait',{ms:1})).ok,true);
+    assert.equal((await command('read-only')).kind,'success');
+    assert.match((await call('wdc_click',{x:1,y:2})).text,/permission_denied/);
+    assert.equal((await command('disabled')).kind,'success');
+    assert.match((await call('wdc_wait',{ms:1})).text,/permission_denied/);
+    assert.equal((await command('stop')).kind,'success');
+    assert.equal((await call('wdc_stop')).ok,true);
+    assert.equal((await command('ask')).kind,'success');
+    assert.equal((await call('wdc_resume')).ok,true);
+    preset='custom';
+    sandbox='read-only';
+    assert.match((await call('wdc_click',{x:1,y:2})).text,/permission_denied/);
+    assert.match((await call('wdc_wait',{ms:1})).text,/permission_denied/);
+    assert.equal(requests,0);
+  } finally {m.close();}
+});
+
+test('rememberSessionApprovals false keeps per-call approvals on supported hosts',async()=>{
+  let requests=0;
+  const m=await mounted({}, {permissionMode:'ask',rememberSessionApprovals:false,
+    testPresets:{current:()=> 'workspace-write'},
+    testApproval:{request:async()=>{requests++;return 'allowed-once';}},
+  });
+  const session={};
+  try {
+    const wait=m.tools.find(t=>t.name==='wdc_wait');
+    for(let i=0;i<2;i++) assert.equal((await wait.execute({ms:1},execution(wait.name,session))).ok,true);
+    assert.equal(requests,2);
+  } finally {m.close();}
 });
 
 test('session mode is isolated, model arguments cannot grant permissions, and stop bypasses approval',async()=>{

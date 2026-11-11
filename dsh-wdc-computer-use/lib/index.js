@@ -85,6 +85,7 @@ const DEFAULTS = {
   /** Quiet reuse between calls; release the own worker after one idle minute. */
   idleTimeoutMs: 60000,
   permissionMode: 'ask',
+  rememberSessionApprovals: true,
   approvalTimeoutMs: 60000,
   /** 截图落盘目录，留空则用系统临时目录下的 wdc-shots */
   shotDir: '',
@@ -857,7 +858,14 @@ export function apply(ctx, config) {
     }
   };
 
-  const permissions=new SessionPermissions({mode:options.permissionMode,timeoutMs:options.approvalTimeoutMs,getApproval:()=>ctx.get?.('approval')});
+  const getPresets = () => ctx.get?.('permissionPresets');
+  const permissions = new SessionPermissions({
+    mode:options.permissionMode,
+    timeoutMs:options.approvalTimeoutMs,
+    rememberApprovals:options.rememberSessionApprovals,
+    getApproval:() => ctx.get?.('approval'),
+    getPresets,
+  });
   const bridge = new McpBridge(options, log);
   bridge.instructions = TOOL_CATALOG.instructions;
   options.expectedTools = TOOL_CATALOG.tools;
@@ -886,6 +894,37 @@ export function apply(ctx, config) {
   }
 
   reportStatus({});
+
+  ctx.on?.('session/event', (session, event) => permissions.onSessionEvent(session, event));
+  ctx.on?.('tools/pre-execute', (exec, next) => {
+    if (manifest.some(entry => entry.name === exec.name && entry.source !== 'stop')) {
+      permissions.preflight(exec);
+    }
+    return next();
+  }, {prepend:true});
+
+  // DSH sends slash commands through its direct UI command service.
+  ctx.inject(['commands'], (commandCtx) => {
+    commandCtx.commands?.register({
+      definitionId:'computeruse-dsh/access',
+      name:'wdc-access',
+      description:'设置或撤销本会话的电脑操作权限，也可紧急停止',
+      input:{hint:'ask | read-only | disabled | revoke | stop'},
+      async handler(invocation) {
+        if (invocation.rawInput.trim() !== 'stop') return permissions.command(invocation);
+        if (!invocation.agent?.session || invocation.signal?.aborted) {
+          return {kind:'error', text:'电脑操作权限命令需要有效的 DSH 会话。'};
+        }
+        permissions.revoke(invocation.agent.session);
+        try {
+          await bridge.callTool('stop', {});
+          return {kind:'success', text:'已停止电脑操作并撤销本会话的插件授权。'};
+        } catch {
+          return {kind:'error', text:'停止信号写入失败，插件已阻止后续输入。'};
+        }
+      },
+    });
+  });
 
   ctx.inject(['tools'], (toolsCtx) => {
     const tools = toolsCtx?.tools;
@@ -948,8 +987,15 @@ export function apply(ctx, config) {
               async execute(args,exec) {
                 const input = args && typeof args === 'object' ? args : {};
                 let lease;
-                try {if(tool.name!=='stop')lease=await permissions.acquire(tool.name,{...exec,name:hostName});}
-                catch(error){return {ok:false,text:JSON.stringify({ok:false,error_code:error.code||'approval_error',error:'电脑操作未获授权或已取消'})};}
+                try {
+                  if (tool.name === 'stop') permissions.revoke(exec?.agent?.session);
+                  else lease = await permissions.acquire(tool.name, exec, hostName);
+                } catch (error) {
+                  const code = error.code || 'approval_error';
+                  const message = /^(permission_|approval_unavailable$|operation_cancelled$)/.test(code)
+                    ? error.message : '电脑操作未获授权或已取消';
+                  return {ok:false,text:JSON.stringify({ok:false,error_code:code,error:message})};
+                }
                 executions += 1;
                 try {
                 // Stop is local and immediate, even while Python/display is starting.
@@ -991,6 +1037,10 @@ export function apply(ctx, config) {
           profile: profileName,
           tools: manifest.map((entry) => entry.name),
           instructionsChars: bridge.instructions.length,
+          permissionIntegration: {
+            hostPresetsAvailable: typeof getPresets()?.current === 'function',
+            directCommandsAvailable: typeof ctx.get?.('commands')?.register === 'function',
+          },
           python: options.python,
           cwd: options.cwd,
         });
