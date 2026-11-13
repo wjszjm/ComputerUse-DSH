@@ -66,6 +66,7 @@ class Frame:
     context_layout: tuple | None = None
     invalid_reason: str = ""
     capture_target: tuple[int, int] | None = None
+    background: bool = False
 
     # -- 坐标换算 ------------------------------------------------------- #
     def image_to_screen(self, x: float, y: float) -> tuple[int, int]:
@@ -101,7 +102,7 @@ class Frame:
             },
             "captured_at": round(self.captured_at, 3),
             "coordinate_space": "image",
-            "coordinate_hint": (
+            "coordinate_hint": "Background window image pixels are for observation and OCR only." if self.background else (
                 f"image {self.image.size[0]}x{self.image.size[1]}, scale {self.scale:.3f}, "
                 f"screen origin {self.screen_origin[0]},{self.screen_origin[1]}. "
                 "Pass image pixels and frame_id to click/drag; the server converts each axis. "
@@ -299,6 +300,7 @@ def capture(
     grid_step: int = 100,
     max_edge: int = 1600,
     validate_pixel=None,
+    grab_window=None,
 ) -> Frame:
     """截屏并返回 Frame。
 
@@ -327,7 +329,7 @@ def capture(
 
     validate_target()
     captured_at, captured_monotonic = time.time(), time.monotonic()
-    raw = _grab_raw(origin[0], origin[1], size[0], size[1])
+    raw = _grab_raw(origin[0], origin[1], size[0], size[1]) if grab_window is None else grab_window()
     validate_target()
     raw_size = raw.size
     if raw_size != size:

@@ -17,9 +17,14 @@ def target_window(handle: int, expected_pid: int, *, foreground: bool = True):
     platform_win.setup_dpi_awareness()
     if type(handle) is not int or handle <= 0 or type(expected_pid) is not int or expected_pid <= 0:
         raise ValueError("需要有效的窗口句柄和 PID。")
+    if not windows.IS_WINDOWS:
+        raise windows.WindowError("窗口操作仅支持 Windows。", "window_unavailable")
     hwnd, pid = windows._target(None, handle, expected_pid)
     if not windows.user32.IsWindowVisible(hwnd) or windows.user32.IsIconic(hwnd):
         raise windows.WindowError("目标窗口需要可见且未最小化。", "window_not_visible")
+    cloaked = ctypes.c_uint()
+    if windows.dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+        raise windows.WindowError("目标窗口当前不可见。", "window_not_visible")
     if foreground and windows.user32.GetForegroundWindow() != hwnd:
         raise windows.WindowError("请先确认目标窗口位于前台。", "window_not_foreground")
     return hwnd, pid, windows._window_rect(hwnd)
@@ -37,14 +42,14 @@ def window_at_point(handle, x, y):
     return bool(child and ancestor(child,2)==handle)
 
 
-def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, select=None):
+def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, select=None, background=False):
     if not 1 <= limit <= 80 or len(name) > 160 or len(control_type) > 64:
         raise ValueError("控件查询超过支持范围。")
     try:
         import uiautomation as uia
     except ImportError as exc:
         raise SafetyViolation("当前 Python 环境缺少 UI Automation 支持。", "uia_unavailable") from exc
-    hwnd, pid, bounds = target_window(handle, expected_pid)
+    hwnd, pid, bounds = target_window(handle, expected_pid, foreground=not background)
     results = []
     queue = deque()
     deadline = time.monotonic() + 2
@@ -81,16 +86,20 @@ def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, se
             info = {"id":identifier,"name":label[:160],"type":kind,"rect":box,"enabled":control.IsEnabled,"depth":depth}
             if select is not None:
                 if info["id"] == select[0]:
-                    if target_window(handle, expected_pid)[2] != bounds:
+                    if target_window(handle, expected_pid, foreground=not background)[2] != bounds:
                         raise windows.WindowError("控件所在窗口已变化。", "window_identity_changed")
-                    return invoke(control, info, *select[1:])
+                    focused_window = windows.user32.GetForegroundWindow() if background else None
+                    outcome = invoke(control, info, *select[1:])
+                    if background:
+                        outcome["foreground_changed"] = windows.user32.GetForegroundWindow() != focused_window
+                    return outcome
             else:
                 results.append(info)
                 if len(results) == limit:
                     break
     if select is not None:
         raise windows.WindowError("控件已变化或不可用，请重新读取控件树。", "control_not_found")
-    if target_window(handle, expected_pid)[2] != bounds:
+    if target_window(handle, expected_pid, foreground=not background)[2] != bounds:
         raise windows.WindowError("读取控件期间窗口已变化。", "window_identity_changed")
     return {"controls":results,"truncated":truncated or bool(queue)}
 

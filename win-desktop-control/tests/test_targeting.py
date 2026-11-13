@@ -80,6 +80,33 @@ def test_layout_change_with_same_virtual_bounds_is_detected(app,fake_backend,mon
     assert fake_backend.calls==[]
 
 
+def test_mixed_dpi_negative_origin_uses_physical_pixels_and_rejects_dpi_change(app,fake_backend,monkeypatch):
+    layout = [capture.Monitor(0,-1600,0,4160,1600), capture.Monitor(1,0,0,2560,1600,True,dpi_scale=1.5),
+              capture.Monitor(2,-1600,0,1600,900,dpi_scale=1.0)]
+    monkeypatch.setattr(capture,'list_monitors',lambda:layout)
+    monkeypatch.setattr(platform_win,'get_virtual_screen',lambda:SimpleNamespace(left=-1600,top=0,right=2560,bottom=1600))
+    shot = app.screenshot(region=[-300,80,600,320],scale=0.5,grid=False)
+    assert shot.ok
+    result = app.click(25,40,coordinate_mode='image',frame_id=shot.data['frame_id'])
+    assert result.ok and result.data['screen_point']==[-250,160]
+    shot = app.screenshot(region=[-300,80,600,320],scale=0.5,grid=False)
+    layout[2].dpi_scale = 1.25
+    assert app.click(25,40,coordinate_mode='image',frame_id=shot.data['frame_id']).code=='frame_context_changed'
+
+
+def test_background_capture_never_samples_desktop_and_rejects_pointer_input(app,fake_backend,monkeypatch):
+    from wdc import desktop_targets, window_capture
+
+    bounds=(5,7,205,107)
+    monkeypatch.setattr(desktop_targets,'target_window',lambda handle,pid,*,foreground:(handle,pid,bounds))
+    monkeypatch.setattr(window_capture,'grab',lambda *args:Image.new('RGB',(200,100)))
+    monkeypatch.setattr(capture,'_grab_raw',lambda *args:pytest.fail('background capture must be window-only'))
+    shot=app.window_screenshot(100,200,background=True)
+    assert shot.ok and shot.data['pointer_input'] is False
+    assert app.click(25,40,coordinate_mode='image',frame_id=shot.data['frame_id']).code=='background_frame'
+    assert fake_backend.calls==[]
+
+
 def test_input_during_capture_makes_the_returned_frame_unusable_for_targeting(app,monkeypatch):
     actual=capture.capture
     def changed_capture(**kwargs):

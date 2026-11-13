@@ -537,7 +537,7 @@ export const TOOL_CATALOG = {
     },
     {
       "name": "window_screenshot",
-      "description": "截取经句柄和 PID 验证的前台窗口区域。返回坐标帧。",
+      "description": "按句柄和 PID 截图。默认截取前台窗口区域，可选后台模式使用窗口自身图像。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -554,6 +554,11 @@ export const TOOL_CATALOG = {
             "type": "number",
             "default": 0.0,
             "description": "缩放比，0=自动"
+          },
+          "background": {
+            "type": "boolean",
+            "default": false,
+            "description": "允许使用目标窗口自身的截图或 UIA 提供程序，且不主动切换焦点。后台截图坐标仅供观察。"
           }
         },
         "required": [
@@ -565,7 +570,7 @@ export const TOOL_CATALOG = {
     },
     {
       "name": "inspect_controls",
-      "description": "读取指定前台窗口的 UI Automation 控件和物理坐标。",
+      "description": "读取指定窗口的 UI Automation 控件和物理坐标，可选后台模式。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -589,6 +594,11 @@ export const TOOL_CATALOG = {
           "limit": {
             "type": "integer",
             "default": 50
+          },
+          "background": {
+            "type": "boolean",
+            "default": false,
+            "description": "允许使用目标窗口自身的截图或 UIA 提供程序，且不主动切换焦点。后台截图坐标仅供观察。"
           }
         },
         "required": [
@@ -627,6 +637,11 @@ export const TOOL_CATALOG = {
           },
           "text": {
             "type": "string"
+          },
+          "background": {
+            "type": "boolean",
+            "default": false,
+            "description": "允许使用目标窗口自身的截图或 UIA 提供程序，且不主动切换焦点。后台截图坐标仅供观察。"
           }
         },
         "required": [
@@ -695,6 +710,11 @@ export const TOOL_CATALOG = {
               "zh-TW"
             ],
             "default": "en-US"
+          },
+          "background": {
+            "type": "boolean",
+            "default": false,
+            "description": "允许使用目标窗口自身的截图或 UIA 提供程序，且不主动切换焦点。后台截图坐标仅供观察。"
           }
         },
         "required": [

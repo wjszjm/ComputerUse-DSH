@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __all__ = ["__version__", "main"]
 
 PROTOCOL_VERSION = "2024-11-05"

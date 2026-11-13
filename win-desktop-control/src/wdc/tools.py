@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from contextlib import nullcontext
 from typing import Any, Callable
 
-from . import capture, desktop_targets, input_ctl, platform_win, stop_hotkey, windows
+from . import capture, desktop_targets, input_ctl, platform_win, stop_hotkey, window_capture, windows
 from .config import Config, load_config
 from .safety import AuditRecord, EmergencyStop, SafetyGuard, SafetyViolation
 from .targeting import MAX_FRAME_AGE_SECONDS, monitor_signature, number, on_monitor, window_identity
@@ -156,7 +156,7 @@ class ComputerUse:
         self.session.bump()
         return result
 
-    def _require_frame(self, frame_id=None, snapshot=None):
+    def _require_frame(self, frame_id=None, snapshot=None, *, observation=False):
         frame, revision = snapshot or self.session.frame_snapshot()
         if frame is None:raise SafetyViolation('请先截图。', 'frame_required')
         if frame_id is not None and frame_id != frame.frame_id:
@@ -166,6 +166,14 @@ class ComputerUse:
             raise SafetyViolation('截图超过 30 秒有效期，请重新截图。', 'stale_frame')
         if frame.invalid_reason or frame.revision!=revision:
             raise SafetyViolation('截图期间或之后发生输入，请重新截图。', 'stale_frame')
+        if frame.background:
+            if not observation:
+                raise SafetyViolation('后台截图仅用于观察，请激活窗口后重新截图再输入。', 'background_frame')
+            handle, pid = frame.capture_target
+            x, y = frame.screen_origin
+            w, h = frame.screen_size
+            if desktop_targets.target_window(handle, pid, foreground=False)[2] != (x, y, x+w, y+h):
+                raise SafetyViolation('目标窗口位置已变化，请重新截图。', 'frame_context_changed')
         if frame.context_window is not None and frame.context_window!=window_identity(windows.get_foreground_window()):
             raise SafetyViolation('前台窗口身份或位置已变化，请重新截图。','frame_context_changed')
         if frame.context_layout is not None and frame.context_layout!=monitor_signature(capture.list_monitors()):
@@ -256,6 +264,7 @@ class ComputerUse:
         scale: float = 0.0,
         grid: bool | None = None,
         _target=None,
+        _background=False,
     ) -> ToolResult:
         use_grid = self.config.default_grid if grid is None else bool(grid)
         # 用局部字典持有图片，避免并发截图时实例属性互相覆盖
@@ -267,8 +276,12 @@ class ComputerUse:
         def _capture_impl() -> dict[str, Any]:
             with self.session.lock:
                 revision,active=self.session.revision,self.session.input_active
-            foreground=window_identity(windows.get_foreground_window())
-            bounds_check={} if _target is None else {"validate_pixel":lambda x,y:desktop_targets.window_at_point(_target[0],x,y)}
+            foreground=None if _background else window_identity(windows.get_foreground_window())
+            bounds_check={}
+            if _background:
+                bounds_check["grab_window"] = lambda: window_capture.grab(*_target)
+            elif _target is not None:
+                bounds_check["validate_pixel"] = lambda x,y: desktop_targets.window_at_point(_target[0],x,y)
             frame = capture.capture(
                 monitor=monitor,
                 region=region,
@@ -285,10 +298,11 @@ class ComputerUse:
             frame.context_layout=monitor_signature(frame.monitors)
             if _target is not None:
                 handle,pid,bounds=_target
-                if desktop_targets.target_window(handle,pid)[2]!=bounds:
+                if desktop_targets.target_window(handle,pid,foreground=not _background)[2]!=bounds:
                     raise windows.WindowError("截图期间窗口已变化。", "window_identity_changed")
                 frame.capture_target=(handle,pid)
-            if foreground!=window_identity(windows.get_foreground_window()) or frame.context_layout!=monitor_signature(capture.list_monitors()):
+                frame.background=_background
+            if (not _background and foreground!=window_identity(windows.get_foreground_window())) or frame.context_layout!=monitor_signature(capture.list_monitors()):
                 frame.invalid_reason='capture_context_changed'
             self.session.set_frame(frame,revision,active)
             meta = frame.to_dict()
@@ -300,6 +314,9 @@ class ComputerUse:
             meta["format"] = mime
             meta["bytes"] = len(data)
             meta["grid"] = use_grid
+            if _target is not None:
+                meta["capture_backend"] = "print_window" if _background else "desktop_region"
+                meta["pointer_input"] = not _background
             if self.config.save_screenshots:
                 stamp = time.strftime("%Y%m%d-%H%M%S")
                 filename = f"{stamp}-{int(frame.captured_at * 1000) % 1000:03d}.{self.config.image_format}"
@@ -326,25 +343,25 @@ class ComputerUse:
     # ------------------------------------------------------------------ #
     # 鼠标
     # ------------------------------------------------------------------ #
-    def window_screenshot(self, handle: int, expected_pid: int, scale: float = 0.0) -> ToolResult:
+    def window_screenshot(self, handle: int, expected_pid: int, scale: float = 0.0, background: bool = False) -> ToolResult:
         try:
-            _, _, bounds = desktop_targets.target_window(handle, expected_pid)
+            _, _, bounds = desktop_targets.target_window(handle, expected_pid, foreground=not background)
             left, top, right, bottom = bounds
             result = self.screenshot(monitor="all",region=[left,top,right-left,bottom-top],scale=scale,grid=False,
-                                     _target=(handle,expected_pid,bounds))
+                                     _target=(handle,expected_pid,bounds), _background=background)
             result.action="window_screenshot"
             return result
         except (SafetyViolation, windows.WindowError, ValueError) as exc:
             return ToolResult(False,"window_screenshot",error=str(exc),code=getattr(exc,"code","bad_argument"))
 
-    def inspect_controls(self, handle, expected_pid, name="", control_type="", limit=40):
+    def inspect_controls(self, handle, expected_pid, name="", control_type="", limit=40, background=False):
         return self._finish("inspect_controls",{},lambda:desktop_targets.uia_controls(
-            handle,expected_pid,name=name,control_type=control_type,limit=limit,
+            handle,expected_pid,name=name,control_type=control_type,limit=limit,background=background,
         ))
 
-    def control_action(self, handle, expected_pid, control_id, operation, text=""):
+    def control_action(self, handle, expected_pid, control_id, operation, text="", background=False):
         def run():
-            result=desktop_targets.uia_controls(handle,expected_pid,select=(control_id,operation,text))
+            result=desktop_targets.uia_controls(handle,expected_pid,select=(control_id,operation,text),background=background)
             if result["verification"]["status"] == "failed":
                 return ToolResult(False,"control_action",result,error="控件操作结果未通过读回核验。",code="verification_failed")
             return result
@@ -354,18 +371,18 @@ class ComputerUse:
         def run():
             if platform_win.is_secure_desktop_active():
                 raise SafetyViolation("安全桌面不允许识别。","secure_desktop")
-            frame=self._require_frame(frame_id)
+            frame=self._require_frame(frame_id, observation=True)
             words=desktop_targets.ocr_words(frame.image,language)
-            self._require_frame(frame_id)
+            self._require_frame(frame_id, observation=True)
             return {"words":words,"frame_id":frame_id,"coordinate_space":"image"}
         return self._finish("recognize_text",{},run)
 
-    def locate_target(self, handle, expected_pid, name, frame_id=None, language="en-US"):
+    def locate_target(self, handle, expected_pid, name, frame_id=None, language="en-US", background=False):
         def run():
             if not name.strip() or len(name)>160:
                 raise ValueError("请提供准确的控件名称或文字。")
             try:
-                controls=desktop_targets.uia_controls(handle,expected_pid,name=name,limit=2)
+                controls=desktop_targets.uia_controls(handle,expected_pid,name=name,limit=2,background=background)
                 matches=controls["controls"]
             except SafetyViolation as exc:
                 if exc.code!="uia_unavailable":
@@ -380,19 +397,19 @@ class ComputerUse:
                 return {"route":"uia","control":matches[0]}
             if frame_id is None:
                 raise SafetyViolation("请先调用窗口截图并传入 frame_id。","frame_required")
-            _,_,bounds=desktop_targets.target_window(handle,expected_pid)
-            frame=self._require_frame(frame_id)
+            _,_,bounds=desktop_targets.target_window(handle,expected_pid,foreground=not background)
+            frame=self._require_frame(frame_id, observation=True)
             if frame.capture_target!=(handle,expected_pid) or frame.screen_origin!=bounds[:2] or frame.screen_size!=(bounds[2]-bounds[0],bounds[3]-bounds[1]):
                 raise SafetyViolation("OCR 回退需要该窗口的截图。","frame_context_changed")
             words=desktop_targets.ocr_words(frame.image,language)
-            self._require_frame(frame_id)
+            self._require_frame(frame_id, observation=True)
             matches=desktop_targets.text_match(words,name)
             if len(matches)!=1:
                 raise SafetyViolation("文字目标不存在或不唯一。","target_ambiguous" if matches else "target_not_found")
             x,y=matches[0]
             if not frame.contains_image_point(x,y):
                 raise SafetyViolation("识别结果不在截图范围内。","image_out_of_bounds")
-            return {"route":"ocr","frame_id":frame_id,"image_point":[x,y]}
+            return {"route":"ocr","frame_id":frame_id,"image_point":[x,y],"pointer_input":not frame.background}
         return self._finish("locate_target",{},run)
 
     def batch_windows(self, steps):
