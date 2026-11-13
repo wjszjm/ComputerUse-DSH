@@ -1,6 +1,6 @@
 {
   "name": "dsh-wdc-computer-use",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "displayName": "ComputerUse-DSH",
   "description": "ComputerUse-DSH：为 DeepSeek Harness 提供 Windows 截图、鼠标、键盘和窗口操作。",
   "type": "module",

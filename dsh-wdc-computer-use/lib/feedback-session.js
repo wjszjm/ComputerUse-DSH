@@ -4,9 +4,11 @@ import {VisualFeedback} from './visual-feedback.js';
 const TOOL_STATE=Object.freeze({screen_info:'observing',screenshot:'observing',list_windows:'observing',clipboard_get:'observing',
   click:'clicking',type_text:'typing',press_key:'typing',scroll:'scrolling',wait:'waiting',
   move_mouse:'operating',drag:'operating',activate_window:'operating',window_action:'operating',launch_app:'operating',
-  clipboard_set:'operating',run_command:'operating',stop:'waiting',resume:'waiting'});
+  clipboard_set:'operating',run_command:'operating',stop:'waiting',resume:'waiting',
+  window_screenshot:'observing',inspect_controls:'observing',recognize_text:'observing',locate_target:'observing',
+  control_action:'operating',batch_windows:'operating'});
 const PRIORITY=Object.freeze({observing:1,waiting:2,clicking:3,typing:3,scrolling:3,operating:3});
-const MUTATING=new Set(['click','type_text','press_key','scroll','move_mouse','drag','activate_window','window_action','launch_app','clipboard_set','run_command']);
+const MUTATING=new Set(['click','type_text','press_key','scroll','move_mouse','drag','activate_window','window_action','launch_app','clipboard_set','run_command','control_action','batch_windows']);
 const finite=value=>typeof value==='number'&&Number.isFinite(value);
 const validRect=value=>Boolean(value&&['x','y','width','height'].every(key=>finite(value[key]))&&value.width>0&&value.height>0);
 

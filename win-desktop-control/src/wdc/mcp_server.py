@@ -243,6 +243,24 @@ def build_server(config: Optional[Config] = None) -> Any:
         """解除紧急停止状态。"""
         return out(app.resume())
 
+    def window_screenshot(handle: int, expected_pid: int, scale: float = 0.0):
+        return out(app.window_screenshot(handle,expected_pid,scale))
+
+    def inspect_controls(handle: int, expected_pid: int, name: str = "", control_type: str = "", limit: int = 40):
+        return out(app.inspect_controls(handle,expected_pid,name,control_type,limit))
+
+    def control_action(handle: int, expected_pid: int, control_id: str, operation: str, text: str = ""):
+        return out(app.control_action(handle,expected_pid,control_id,operation,text))
+
+    def recognize_text(frame_id: str, language: str = "en-US"):
+        return out(app.recognize_text(frame_id,language))
+
+    def locate_target(handle: int, expected_pid: int, name: str, frame_id: Optional[str] = None, language: str = "en-US"):
+        return out(app.locate_target(handle,expected_pid,name,frame_id,language))
+
+    def batch_windows(steps: List[dict]):
+        return out(app.batch_windows(steps))
+
     # ------------------------------------------------------------------ #
     # 注册
     # ------------------------------------------------------------------ #
@@ -278,6 +296,11 @@ def build_server(config: Optional[Config] = None) -> Any:
 
     for fn, name, description, annos in tools:
         reg.add(fn, name, description.strip(), annos)
+    from .schemas import tool_specs
+    descriptions={spec["name"]:spec["description"] for spec in tool_specs()}
+    for fn, annotations in [(window_screenshot,readonly),(inspect_controls,readonly),(control_action,mutating),
+                            (recognize_text,readonly),(locate_target,readonly),(batch_windows,mutating)]:
+        reg.add(fn,fn.__name__,descriptions[fn.__name__],annotations)
 
     return server
 

@@ -76,6 +76,47 @@ def get_dpi_scale() -> float:
         return 1.0
 
 
+def monitor_dpi_scale(x: int, y: int) -> float | None:
+    if not IS_WINDOWS:
+        return None
+    try:
+        from ctypes import wintypes
+        nearest = ctypes.windll.user32.MonitorFromPoint
+        nearest.argtypes = [wintypes.POINT,wintypes.DWORD]
+        nearest.restype = wintypes.HANDLE
+        monitor = nearest(wintypes.POINT(x,y),2)
+        dpi_x, dpi_y = ctypes.c_uint(), ctypes.c_uint()
+        get_dpi = ctypes.windll.shcore.GetDpiForMonitor
+        get_dpi.argtypes = [wintypes.HANDLE,ctypes.c_int,ctypes.POINTER(ctypes.c_uint),ctypes.POINTER(ctypes.c_uint)]
+        if monitor and get_dpi(monitor,0,ctypes.byref(dpi_x),ctypes.byref(dpi_y)) == 0 and dpi_x.value:
+            return round(dpi_x.value/96,3)
+    except (AttributeError,OSError):
+        pass
+    return None
+
+
+def enumerate_displays() -> list[dict]:
+    if not IS_WINDOWS:
+        return []
+    from ctypes import wintypes
+    user32=ctypes.windll.user32
+    displays=[]
+    callback_type=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HANDLE,wintypes.HDC,
+                                    ctypes.POINTER(wintypes.RECT),wintypes.LPARAM)
+
+    @callback_type
+    def collect(_monitor, _dc, rect, _param):
+        bounds=rect.contents
+        displays.append({"left":bounds.left,"top":bounds.top,
+                         "width":bounds.right-bounds.left,"height":bounds.bottom-bounds.top})
+        return True
+
+    if not user32.EnumDisplayMonitors(None,None,collect,0) or not displays:
+        return []
+    virtual=get_virtual_screen()
+    return [{"left":virtual.left,"top":virtual.top,"width":virtual.width,"height":virtual.height},*displays]
+
+
 # --------------------------------------------------------------------------- #
 # 屏幕 / 会话
 # --------------------------------------------------------------------------- #

@@ -34,6 +34,7 @@ def test_tool_count_and_names(server):
         "type_text", "press_key", "clipboard_get", "clipboard_set",
         "list_windows", "activate_window", "window_action", "launch_app",
         "run_command", "wait", "stop", "resume",
+        "window_screenshot", "inspect_controls", "control_action", "recognize_text", "locate_target", "batch_windows",
     }
     assert names == expected
 

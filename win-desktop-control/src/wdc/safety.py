@@ -87,7 +87,10 @@ class SafetyGuard:
         if not path:
             return False
         try:
-            return Path(path).exists()
+            Path(path).stat()
+            return True
+        except FileNotFoundError:
+            return False
         except OSError:
             return True  # 无法检查停止信号时禁止输入，不能当作没有停止。
 

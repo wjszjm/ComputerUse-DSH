@@ -38,7 +38,7 @@ test('browser bundle mounts through the actual module-loader contract and dispos
   const binding={target:()=>store,activate:target=>{assert.equal(target,'wdc-private-images');activated=true;}};
   assert.ok(client.inject.includes('commandUi'));assert.ok(!client.inject.includes('commands'));
   client.apply({uiConversation:{events:{register:e=>events.push(e)},views:{register:e=>views.push(e)},binding:()=>binding},
-    sessions:{list:{getSnapshot:()=>({byId:{one:{}}})},binding:()=>({ctx:{}})},conversation:{},
+    sessions:{list:{getSnapshot:()=>({byId:{one:{}}})},binding:()=>({ctx:{}})},conversation:{input:{for:()=>{}}},
     slots:{inject:(name,fn)=>fn(),register:(options,component)=>slots.push({options,component})},
     commandUi:{register:c=>commands.push(c)},effect:fn=>effects.push(fn())});
   const policy=vm.runInContext("globalThis[Symbol.for('dsh.wdc.ui-policy.v1')]",sandbox);
@@ -46,7 +46,7 @@ test('browser bundle mounts through the actual module-loader contract and dispos
   assert.equal(policy.hiddenMedia('https://example.com/ordinary.png'),false);
   assert.equal(commands[0].label(),'电脑操作');
   const toolViews=slots.filter(entry=>entry.options.name==='tool.call.toolview');
-  assert.equal(toolViews.length,18);
+  assert.equal(toolViews.length,24);
   const screenshotView=toolViews.find(entry=>entry.options.key==='wdc_screenshot').component;
   assert.equal(screenshotView({phase:'start'}),'电脑操作调用中');
   assert.equal(screenshotView({phase:'result'}),null);

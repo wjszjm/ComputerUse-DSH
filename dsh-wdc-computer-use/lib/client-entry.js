@@ -2,12 +2,103 @@ import {TOOL_CATALOG} from './tool-catalog.js';
 import {toggleIntent,privacyIndex,visibleImages,canonicalPath,callDisplay} from './client-policy.js';
 
 export const inject=['slots','commandUi','sessions','uiConversation','conversation'];
-export function apply(ctx,config={}) {
+const settingsTools = {
+  window_screenshot:'窗口截图', inspect_controls:'读取控件', control_action:'操作控件',
+  recognize_text:'本机 OCR', locate_target:'定位控件或文字', batch_windows:'验证式窗口批次',
+};
+const baseSettingsTools = {
+  screenshot:'截图',screen_info:'屏幕信息',click:'点击',move_mouse:'移动鼠标',drag:'拖拽',
+  type_text:'输入文字',press_key:'按键',scroll:'滚动',list_windows:'列出窗口',
+  activate_window:'激活窗口',window_action:'窗口操作',clipboard_get:'读取剪贴板',wait:'等待',
+};
+
+function registerSettings(slots, react) {
+  if (!react) return;
+  const {createElement:h,useEffect,useState}=react;
+  const call=async (payload,signal)=>{
+    const endpoint=new URL('api/computeruse-dsh/settings',document.baseURI);
+    const response=await fetch(endpoint,{
+      method:payload?'POST':'GET',credentials:'same-origin',signal,
+      headers:{'x-dsh-plugin':'dsh-wdc-computer-use',...(payload?{'content-type':'application/json'}:{})},
+      body:payload?JSON.stringify(payload):undefined,
+    });
+    if (!response.headers.get('content-type')?.includes('application/json')) throw new Error('DSH 设置接口不可用。');
+    const data=await response.json();
+    if (!response.ok) throw new Error(data.error || 'DSH 设置接口不可用。');
+    return data;
+  };
+  slots.inject('plugins.bundle.config',()=>slots.register({
+    name:'plugins.bundle.config',key:'dsh-wdc-computer-use',
+  },function ComputerUseSettings(){
+    const [draft,update]=useState(null);
+    const [message,show]=useState('正在读取设置');
+    const [busy,setBusy]=useState(false);
+    useEffect(()=>{
+      const controller=new AbortController();
+      call(null,controller.signal).then(data=>{update(data);show('');},
+        error=>{if(!controller.signal.aborted)show(error.message);});
+      return ()=>controller.abort();
+    },[]);
+    if (!draft) return h('p',{role:'status'},message);
+    const set=(key,value)=>update(current=>({...current,[key]:value}));
+    const choices=(label,key,items)=>h('label',{style:{display:'block'}},label,' ',
+      h('select',{value:draft[key],onChange:event=>set(key,event.target.value)},
+        Object.entries(items).map(([value,title])=>h('option',{key:value,value},title))));
+    const toggle=(label,checked,change)=>h('label',{style:{display:'block'}},
+      h('input',{type:'checkbox',checked,onChange:event=>change(event.target.checked)}),' ',label);
+    return h('section',null,
+      h('p',null,`已注册 ${draft.registered} 项工具 · ${draft.runtime} · 权限模式 ${draft.permissionMode}`),
+      h('fieldset',{disabled:busy},
+        h('legend',null,'电脑操作设置'),
+        choices('工具档位','profile',{minimal:'精简',standard:'标准',full:'全部基础工具'}),
+        choices('停止快捷键','stopHotkey',{'':'关闭',esc:'Esc','ctrl+shift+f12':'Ctrl + Shift + F12'}),
+        h('label',{style:{display:'block'}},'截图缩放（0 为自动） ',
+          h('input',{type:'number',min:0,max:1,step:0.05,value:draft.screenshotScale,
+            onChange:event=>set('screenshotScale',Number(event.target.value))})),
+        toggle('显示桌面操作提示',draft.feedbackEnabled,value=>set('feedbackEnabled',value)),
+        ...Object.entries(settingsTools).map(([key,label])=>h('div',{key},toggle(label,draft.enableTools.includes(key),
+          enabled=>set('enableTools',enabled?[...draft.enableTools,key]:draft.enableTools.filter(item=>item!==key))))),
+        h('details',null,h('summary',null,'从当前档位停用工具'),
+          ...Object.entries(baseSettingsTools).map(([key,label])=>h('div',{key},toggle(label,draft.disabledTools.includes(key),
+            disabled=>set('disabledTools',disabled?[...draft.disabledTools,key]:draft.disabledTools.filter(item=>item!==key)))))),
+        h('button',{type:'button',onClick:async()=>{
+          setBusy(true);
+          try {
+            await call(draft);
+            update(await call(null));
+            show('已保存');
+          } catch(error) {show(error.message);}
+          finally {setBusy(false);}
+        }},'保存')),
+      h('p',{role:'status'},message));
+  }));
+}
+
+export function apply(ctx,config={},react) {
+  const slots=ctx.slots;
+  if(typeof slots?.inject!=='function'||typeof slots?.register!=='function')return;
+  registerSettings(slots,react);
   const names=new Set(TOOL_CATALOG.tools.map(tool=>`${config.toolPrefix??'wdc_'}${tool.name}`));
+  slots.inject('tool.call.toolview',()=>{
+    for(const name of names){
+      slots.register({name:'tool.call.toolview',key:name,priority:1000},
+        props=>props.phase==='start'?'电脑操作调用中':null);
+    }
+  });
+  if(typeof ctx.commandUi?.register==='function'&&typeof ctx.sessions?.binding==='function'&&
+     typeof ctx.conversation?.input?.for==='function'){
+    ctx.commandUi.register({name:'computer-use',label:()=> '电脑操作',description:()=> '选择或取消当前草稿的电脑操作意图；调用仍需权限',
+      available:session=>!!ctx.sessions.binding(session.sessionId),ui:{kind:'action',run(session){
+        const binding=ctx.sessions.binding(session.sessionId);
+        if(binding)toggleIntent(ctx.conversation.input.for(binding.ctx));
+      }}});
+  }
+  if(typeof ctx.uiConversation?.events?.register!=='function'||
+     typeof ctx.uiConversation?.views?.register!=='function'||typeof ctx.uiConversation?.binding!=='function')return;
   const target='wdc-private-images';
   ctx.uiConversation.events.register({kind:target,target,
     match:event=>event.type==='tool/result'&&(event.data.meta?.wdc?.version===1||
-      (event.data.meta?.wdc?.version===2&&event.data.meta.wdc.tool==='screenshot')||
+      (event.data.meta?.wdc?.version===2&&['screenshot','window_screenshot'].includes(event.data.meta.wdc.tool))||
       (typeof event.data.meta?.path==='string'&&event.data.message?.content?.some(item=>item.type==='image')))?{id:String(event.seq),role:'start'}:null,
     start:(_context,match)=>({meta:match.event.data.meta,message:{content:(match.event.data.message?.content??[])
       .filter(item=>item.type==='image').map(item=>({type:'image',attachment:{attachmentId:item.attachment?.attachmentId}}))}}),update:context=>context.state,
@@ -50,17 +141,6 @@ export function apply(ctx,config={}) {
     callDisplay:(name,call)=>callDisplay(name,call,index(),names)};
   globalThis[key]=policy;
   ctx.effect(()=>()=>{if(globalThis[key]===policy)delete globalThis[key];});
-  ctx.commandUi.register({name:'computer-use',label:()=> '电脑操作',description:()=> '选择或取消当前草稿的电脑操作意图；调用仍需权限',
-    available:session=>!!ctx.sessions.binding(session.sessionId),ui:{kind:'action',run(session){
-      const binding=ctx.sessions.binding(session.sessionId);
-      if(binding)toggleIntent(ctx.conversation.input.for(binding.ctx));
-    }}});
-  ctx.slots.inject('tool.call.toolview',()=>{
-    for(const name of names){
-      ctx.slots.register({name:'tool.call.toolview',key:name,priority:1000},
-        props=>props.phase==='start'?'电脑操作调用中':null);
-    }
-  });
   for(const name of ['conversation.chat.message.images','conversation.chat.user.images','conversation.trajectory.images','tool.call.images']){
     ctx.slots.inject(name,()=>ctx.slots.register({name,priority:1000,
       inject:id=>({hooks:{wdcRecords:recordsFor(id)}})},function Images(props){

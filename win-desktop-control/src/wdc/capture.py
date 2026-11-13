@@ -32,6 +32,7 @@ class Monitor:
     height: int
     primary: bool = False
     name: str = ""
+    dpi_scale: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +43,7 @@ class Monitor:
             "height": self.height,
             "primary": self.primary,
             "name": self.name,
+            "dpi_scale": self.dpi_scale,
         }
 
 
@@ -63,6 +65,7 @@ class Frame:
     context_window: tuple | None = None
     context_layout: tuple | None = None
     invalid_reason: str = ""
+    capture_target: tuple[int, int] | None = None
 
     # -- 坐标换算 ------------------------------------------------------- #
     def image_to_screen(self, x: float, y: float) -> tuple[int, int]:
@@ -124,9 +127,14 @@ def _mss_factory():
 
 def list_monitors() -> list[Monitor]:
     """枚举显示器。index=0 表示拼接后的整个虚拟桌面。"""
-    factory = _mss_factory()
-    with factory() as sct:
-        raw = list(sct.monitors)
+    try:
+        factory = _mss_factory()
+        with factory() as sct:
+            raw = list(sct.monitors)
+    except Exception as error:
+        raw = platform_win.enumerate_displays()
+        if not raw:
+            raise CaptureError("无法读取显示器布局。") from error
     monitors: list[Monitor] = []
     for i, m in enumerate(raw):
         is_primary = bool(m.get("is_primary", False))
@@ -139,6 +147,7 @@ def list_monitors() -> list[Monitor]:
                 height=int(m.get("height", 0)),
                 primary=is_primary,
                 name=str(m.get("output", "") or ""),
+                dpi_scale=platform_win.monitor_dpi_scale(int(m.get("left",0)),int(m.get("top",0))) if i else None,
             )
         )
     # 后端未标注主屏时，用「包含原点」的显示器兜底
@@ -193,10 +202,19 @@ def _resolve_region(
 
 
 def _grab_raw(left: int, top: int, width: int, height: int):
-    factory = _mss_factory()
-    with factory() as sct:
-        shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
-        return Image.frombytes("RGB", shot.size, shot.rgb)
+    try:
+        factory = _mss_factory()
+        with factory() as sct:
+            shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
+            return Image.frombytes("RGB", shot.size, shot.rgb)
+    except Exception as error:
+        if not platform_win.IS_WINDOWS:
+            raise CaptureError("截图后端不可用。") from error
+        try:
+            from PIL import ImageGrab
+            return ImageGrab.grab(bbox=(left,top,left+width,top+height),all_screens=True).convert("RGB")
+        except Exception as fallback:
+            raise CaptureError("两个截图后端均无法捕获指定区域。") from fallback
 
 
 def _load_font(size: int):
@@ -280,6 +298,7 @@ def capture(
     grid: bool = True,
     grid_step: int = 100,
     max_edge: int = 1600,
+    validate_pixel=None,
 ) -> Frame:
     """截屏并返回 Frame。
 
@@ -296,9 +315,23 @@ def capture(
 
     monitors = list_monitors()
     origin, size, monitors = _resolve_region(monitor, region, monitors)
+    def validate_target():
+        if validate_pixel is None:
+            return
+        x,y=origin
+        width,height=size
+        if not all(validate_pixel(px,py) for px,py in (
+            (x+width*i//4,y+height*j//4) for i in (1,2,3) for j in (1,2,3)
+        )):
+            raise CaptureError("目标窗口在采集位置被遮挡。")
+
+    validate_target()
     captured_at, captured_monotonic = time.time(), time.monotonic()
     raw = _grab_raw(origin[0], origin[1], size[0], size[1])
+    validate_target()
     raw_size = raw.size
+    if raw_size != size:
+        raise CaptureError("截图后端返回了与请求范围不符的图像尺寸。")
 
     if scale and scale > 0:
         factor = float(scale)

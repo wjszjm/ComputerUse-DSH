@@ -21,7 +21,7 @@ export function canonicalPath(value) {
 export function privacyIndex(records) {
   const paths=new Set(),ids=new Set();
   for(const data of records){
-    if(data.meta?.wdc?.version===2&&data.meta.wdc.tool==='screenshot'){
+    if(data.meta?.wdc?.version===2&&['screenshot','window_screenshot'].includes(data.meta.wdc.tool)){
       for(const id of data.meta.wdc.imageIds??[])if(typeof id==='string')ids.add(id);
     }
     if(data.meta?.wdc?.version!==1)continue;

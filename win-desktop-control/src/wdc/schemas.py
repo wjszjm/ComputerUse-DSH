@@ -64,6 +64,18 @@ _PARAM = {
     "limit": {"type": "integer", "default": 50},
     "width": {"type": "integer"},
     "height": {"type": "integer"},
+    "name": {"type":"string","description":"准确的控件名称或文字"},
+    "control_type": {"type":"string","description":"可选的 UIA 控件类型，例如 ButtonControl"},
+    "control_id": {"type":"string","description":"inspect_controls 返回的控件身份"},
+    "operation": {"type":"string","enum":["invoke","set_value","select"]},
+    "language": {"type":"string","enum":["en-US","zh-CN","zh-TW"],"default":"en-US"},
+    "steps": {"type":"array","minItems":1,"maxItems":6,"items":{
+        "type":"object","required":["action","handle","expected_pid"],"additionalProperties":False,
+        "properties":{
+            "action":{"type":"string","enum":["focus","maximize","minimize","restore","move","resize","topmost","untopmost"]},
+            **{key:{"type":"integer"} for key in ("handle","expected_pid","x","y","width","height")},
+        },
+    }},
     "x1": {"type": "number"}, "y1": {"type": "number"},
     "x2": {"type": "number"}, "y2": {"type": "number"},
 }
@@ -181,6 +193,18 @@ def tool_specs() -> list[dict[str, Any]]:
             "description": "解除紧急停止。",
             "parameters": _params(),
         },
+        {"name":"window_screenshot","description":"截取经句柄和 PID 验证的前台窗口区域。返回坐标帧。",
+         "parameters":_params("handle","expected_pid","scale",required=["handle","expected_pid"])},
+        {"name":"inspect_controls","description":"读取指定前台窗口的 UI Automation 控件和物理坐标。",
+         "parameters":_params("handle","expected_pid","name","control_type","limit",required=["handle","expected_pid"])},
+        {"name":"control_action","description":"用 UI Automation Invoke、Value 或 SelectionItem 操作最近读取的控件。",
+         "parameters":_params("handle","expected_pid","control_id","operation","text",required=["handle","expected_pid","control_id","operation"])},
+        {"name":"recognize_text","description":"对当前有效截图帧运行本机 OCR，返回文字及图片坐标。",
+         "parameters":_params("frame_id","language",required=["frame_id"])},
+        {"name":"locate_target","description":"优先查找 UIA 控件，可回退到已提供窗口截图帧的 OCR。只定位，不执行。",
+         "parameters":_params("handle","expected_pid","name","frame_id","language",required=["handle","expected_pid","name"])},
+        {"name":"batch_windows","description":"最多执行 6 个支持状态读回的窗口动作，遇到失败即停止。",
+         "parameters":_params("steps",required=["steps"])},
     ]
 
 

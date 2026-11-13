@@ -15,7 +15,8 @@ def run(argv, capsys):
 def test_version(capsys):
     code, out, _ = run(["version"], capsys)
     assert code == 0
-    assert "wdc 1.0.0" in out
+    from wdc import __version__
+    assert f"wdc {__version__}" in out
 
 
 def test_no_args_prints_help(capsys):
@@ -34,7 +35,7 @@ def test_tools_names(capsys):
     code, out, _ = run(["tools", "--format", "names"], capsys)
     assert code == 0
     names = out.strip().splitlines()
-    assert "click" in names and len(names) == 18
+    assert "click" in names and len(names) == 24
 
 
 def test_tools_openai_json(capsys):

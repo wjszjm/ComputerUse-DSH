@@ -534,6 +534,236 @@ export const TOOL_CATALOG = {
         "required": [],
         "additionalProperties": false
       }
+    },
+    {
+      "name": "window_screenshot",
+      "description": "截取经句柄和 PID 验证的前台窗口区域。返回坐标帧。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "integer",
+            "description": "窗口句柄（HWND）"
+          },
+          "expected_pid": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "list_windows 返回的目标 PID，配合 handle 防止窗口身份变化"
+          },
+          "scale": {
+            "type": "number",
+            "default": 0.0,
+            "description": "缩放比，0=自动"
+          }
+        },
+        "required": [
+          "handle",
+          "expected_pid"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "inspect_controls",
+      "description": "读取指定前台窗口的 UI Automation 控件和物理坐标。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "integer",
+            "description": "窗口句柄（HWND）"
+          },
+          "expected_pid": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "list_windows 返回的目标 PID，配合 handle 防止窗口身份变化"
+          },
+          "name": {
+            "type": "string",
+            "description": "准确的控件名称或文字"
+          },
+          "control_type": {
+            "type": "string",
+            "description": "可选的 UIA 控件类型，例如 ButtonControl"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 50
+          }
+        },
+        "required": [
+          "handle",
+          "expected_pid"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "control_action",
+      "description": "用 UI Automation Invoke、Value 或 SelectionItem 操作最近读取的控件。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "integer",
+            "description": "窗口句柄（HWND）"
+          },
+          "expected_pid": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "list_windows 返回的目标 PID，配合 handle 防止窗口身份变化"
+          },
+          "control_id": {
+            "type": "string",
+            "description": "inspect_controls 返回的控件身份"
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "invoke",
+              "set_value",
+              "select"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "handle",
+          "expected_pid",
+          "control_id",
+          "operation"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "recognize_text",
+      "description": "对当前有效截图帧运行本机 OCR，返回文字及图片坐标。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "frame_id": {
+            "type": "string",
+            "description": "screenshot 返回的帧编号，绑定本次定位/输入；输入后需重新截图；不可与 screen 模式混用"
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "en-US",
+              "zh-CN",
+              "zh-TW"
+            ],
+            "default": "en-US"
+          }
+        },
+        "required": [
+          "frame_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "locate_target",
+      "description": "优先查找 UIA 控件，可回退到已提供窗口截图帧的 OCR。只定位，不执行。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "integer",
+            "description": "窗口句柄（HWND）"
+          },
+          "expected_pid": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "list_windows 返回的目标 PID，配合 handle 防止窗口身份变化"
+          },
+          "name": {
+            "type": "string",
+            "description": "准确的控件名称或文字"
+          },
+          "frame_id": {
+            "type": "string",
+            "description": "screenshot 返回的帧编号，绑定本次定位/输入；输入后需重新截图；不可与 screen 模式混用"
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "en-US",
+              "zh-CN",
+              "zh-TW"
+            ],
+            "default": "en-US"
+          }
+        },
+        "required": [
+          "handle",
+          "expected_pid",
+          "name"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "batch_windows",
+      "description": "最多执行 6 个支持状态读回的窗口动作，遇到失败即停止。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "required": [
+                "action",
+                "handle",
+                "expected_pid"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "focus",
+                    "maximize",
+                    "minimize",
+                    "restore",
+                    "move",
+                    "resize",
+                    "topmost",
+                    "untopmost"
+                  ]
+                },
+                "handle": {
+                  "type": "integer"
+                },
+                "expected_pid": {
+                  "type": "integer"
+                },
+                "x": {
+                  "type": "integer"
+                },
+                "y": {
+                  "type": "integer"
+                },
+                "width": {
+                  "type": "integer"
+                },
+                "height": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "steps"
+        ],
+        "additionalProperties": false
+      }
     }
   ]
 };

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from contextlib import nullcontext
 from typing import Any, Callable
 
-from . import capture, input_ctl, platform_win, windows
+from . import capture, desktop_targets, input_ctl, platform_win, stop_hotkey, windows
 from .config import Config, load_config
 from .safety import AuditRecord, EmergencyStop, SafetyGuard, SafetyViolation
 from .targeting import MAX_FRAME_AGE_SECONDS, monitor_signature, number, on_monitor, window_identity
@@ -95,7 +95,12 @@ class ComputerUse:
         result = ToolResult(False, action, {}, error="unset", code="internal_error")
         locked = False
         attempted = False
-        check_input = self.guard.checkpoint(action) if need_input else None
+        checkpoint = self.guard.checkpoint(action) if need_input else None
+        def check_input():
+            if stop_hotkey.should_stop():
+                self.guard.stop("stop hotkey")
+                raise EmergencyStop("已通过紧急停止快捷键停止操作。")
+            checkpoint()
         try:
             if need_input:
                 check_input()
@@ -107,7 +112,7 @@ class ComputerUse:
             if need_input:
                 with self.session.lock:self.session.input_active = True
                 attempted = True
-            with context:
+            with context, (stop_hotkey.input_scope() if need_input else nullcontext()):
                 data = fn() or {}
             if isinstance(data, ToolResult):
                 result = data
@@ -188,6 +193,8 @@ class ComputerUse:
             else:
                 if not frame.contains_image_point(x,y):raise SafetyViolation('图片坐标越界；屏幕坐标请显式使用 screen。','image_out_of_bounds')
                 px,py=self.guard.check_point(*frame.image_to_screen(x,y))
+            if frame.capture_target and not desktop_targets.window_at_point(frame.capture_target[0],px,py):
+                raise SafetyViolation('截图坐标已被其他窗口遮挡。','frame_context_changed')
         elif mode=='normalized':
             if not (0<=x<=1 and 0<=y<=1):raise ValueError('normalized 坐标必须在 0~1。')
             screen=platform_win.get_virtual_screen()
@@ -248,6 +255,7 @@ class ComputerUse:
         region: list[int] | None = None,
         scale: float = 0.0,
         grid: bool | None = None,
+        _target=None,
     ) -> ToolResult:
         use_grid = self.config.default_grid if grid is None else bool(grid)
         # 用局部字典持有图片，避免并发截图时实例属性互相覆盖
@@ -260,6 +268,7 @@ class ComputerUse:
             with self.session.lock:
                 revision,active=self.session.revision,self.session.input_active
             foreground=window_identity(windows.get_foreground_window())
+            bounds_check={} if _target is None else {"validate_pixel":lambda x,y:desktop_targets.window_at_point(_target[0],x,y)}
             frame = capture.capture(
                 monitor=monitor,
                 region=region,
@@ -267,12 +276,18 @@ class ComputerUse:
                 grid=use_grid,
                 grid_step=self.config.grid_step,
                 max_edge=self.config.max_image_edge,
+                **bounds_check,
             )
             data, mime = capture.encode(
                 frame, fmt=self.config.image_format, quality=self.config.jpeg_quality
             )
             frame.context_window=foreground
             frame.context_layout=monitor_signature(frame.monitors)
+            if _target is not None:
+                handle,pid,bounds=_target
+                if desktop_targets.target_window(handle,pid)[2]!=bounds:
+                    raise windows.WindowError("截图期间窗口已变化。", "window_identity_changed")
+                frame.capture_target=(handle,pid)
             if foreground!=window_identity(windows.get_foreground_window()) or frame.context_layout!=monitor_signature(capture.list_monitors()):
                 frame.invalid_reason='capture_context_changed'
             self.session.set_frame(frame,revision,active)
@@ -311,6 +326,115 @@ class ComputerUse:
     # ------------------------------------------------------------------ #
     # 鼠标
     # ------------------------------------------------------------------ #
+    def window_screenshot(self, handle: int, expected_pid: int, scale: float = 0.0) -> ToolResult:
+        try:
+            _, _, bounds = desktop_targets.target_window(handle, expected_pid)
+            left, top, right, bottom = bounds
+            result = self.screenshot(monitor="all",region=[left,top,right-left,bottom-top],scale=scale,grid=False,
+                                     _target=(handle,expected_pid,bounds))
+            result.action="window_screenshot"
+            return result
+        except (SafetyViolation, windows.WindowError, ValueError) as exc:
+            return ToolResult(False,"window_screenshot",error=str(exc),code=getattr(exc,"code","bad_argument"))
+
+    def inspect_controls(self, handle, expected_pid, name="", control_type="", limit=40):
+        return self._finish("inspect_controls",{},lambda:desktop_targets.uia_controls(
+            handle,expected_pid,name=name,control_type=control_type,limit=limit,
+        ))
+
+    def control_action(self, handle, expected_pid, control_id, operation, text=""):
+        def run():
+            result=desktop_targets.uia_controls(handle,expected_pid,select=(control_id,operation,text))
+            if result["verification"]["status"] == "failed":
+                return ToolResult(False,"control_action",result,error="控件操作结果未通过读回核验。",code="verification_failed")
+            return result
+        return self._finish("control_action",{},run,need_input=True)
+
+    def recognize_text(self, frame_id, language="en-US"):
+        def run():
+            if platform_win.is_secure_desktop_active():
+                raise SafetyViolation("安全桌面不允许识别。","secure_desktop")
+            frame=self._require_frame(frame_id)
+            words=desktop_targets.ocr_words(frame.image,language)
+            self._require_frame(frame_id)
+            return {"words":words,"frame_id":frame_id,"coordinate_space":"image"}
+        return self._finish("recognize_text",{},run)
+
+    def locate_target(self, handle, expected_pid, name, frame_id=None, language="en-US"):
+        def run():
+            if not name.strip() or len(name)>160:
+                raise ValueError("请提供准确的控件名称或文字。")
+            try:
+                controls=desktop_targets.uia_controls(handle,expected_pid,name=name,limit=2)
+                matches=controls["controls"]
+            except SafetyViolation as exc:
+                if exc.code!="uia_unavailable":
+                    raise
+                matches=[]
+                controls={"truncated":False}
+            if len(matches)>1:
+                raise SafetyViolation("有多个同名控件，请进一步限定。","target_ambiguous")
+            if controls["truncated"]:
+                raise SafetyViolation("控件查询未能遍历完整目标，无法确认唯一性。","control_search_incomplete")
+            if matches:
+                return {"route":"uia","control":matches[0]}
+            if frame_id is None:
+                raise SafetyViolation("请先调用窗口截图并传入 frame_id。","frame_required")
+            _,_,bounds=desktop_targets.target_window(handle,expected_pid)
+            frame=self._require_frame(frame_id)
+            if frame.capture_target!=(handle,expected_pid) or frame.screen_origin!=bounds[:2] or frame.screen_size!=(bounds[2]-bounds[0],bounds[3]-bounds[1]):
+                raise SafetyViolation("OCR 回退需要该窗口的截图。","frame_context_changed")
+            words=desktop_targets.ocr_words(frame.image,language)
+            self._require_frame(frame_id)
+            matches=desktop_targets.text_match(words,name)
+            if len(matches)!=1:
+                raise SafetyViolation("文字目标不存在或不唯一。","target_ambiguous" if matches else "target_not_found")
+            x,y=matches[0]
+            if not frame.contains_image_point(x,y):
+                raise SafetyViolation("识别结果不在截图范围内。","image_out_of_bounds")
+            return {"route":"ocr","frame_id":frame_id,"image_point":[x,y]}
+        return self._finish("locate_target",{},run)
+
+    def batch_windows(self, steps):
+        """Only actions with native readback may continue a batch."""
+        allowed={"focus","maximize","minimize","restore","move","resize","topmost","untopmost"}
+        if not 1<=len(steps)<=6:
+            return ToolResult(False,"batch_windows",error="批次支持 1 至 6 步。",code="bad_argument")
+        keys={"action","handle","expected_pid","x","y","width","height"}
+        for step in steps:
+            if not isinstance(step,dict) or set(step)-keys or step.get("action") not in allowed or any(
+                type(step.get(key)) is not int or step[key]<=0 for key in ("handle","expected_pid")
+            ):
+                return ToolResult(False,"batch_windows",error="批次包含不支持或缺少目标身份的动作。",code="bad_argument")
+            geometry=set(step)&{"x","y","width","height"}
+            required={"move":{"x","y"},"resize":{"width","height"}}.get(step["action"],set())
+            if (geometry!=required or any(type(step[key]) is not int for key in geometry) or
+                    any(step[key]<=0 for key in geometry&{"width","height"})):
+                return ToolResult(False,"batch_windows",error="批次中的窗口坐标或尺寸无效。",code="bad_argument")
+        if len({(step["handle"],step["expected_pid"]) for step in steps})!=1:
+            return ToolResult(False,"batch_windows",error="一个批次只能操作同一个窗口。",code="bad_argument")
+        def run():
+            completed = []
+            for index, step in enumerate(steps, start=1):
+                progress = {"completed": completed, "failed_step": index}
+                try:
+                    input_ctl.check_cancelled()
+                    if index > 1:
+                        self.guard.check_rate()
+                    result = self._window_result("window_action", windows.window_action(**step))
+                except EmergencyStop as exc:
+                    return ToolResult(False, "batch_windows", progress, error=str(exc), code="emergency_stop")
+                except (SafetyViolation, windows.WindowError) as exc:
+                    return ToolResult(False, "batch_windows", progress, error=str(exc), code=exc.code)
+                if not result.ok or result.data.get("verification", {}).get("status") != "verified":
+                    progress["step_error"] = result.code or "verification_failed"
+                    return ToolResult(False, "batch_windows", progress,
+                                      error="批次已停止，请重新观察。", code="verification_failed")
+                completed.append({"step": index, "action": step["action"], "verified": True})
+            return {"completed": completed, "verification": {"status": "verified", "method": "window_readback"}}
+
+        return self._finish("batch_windows", {}, run, need_input=True)
+
     def click(
         self,
         x: float,

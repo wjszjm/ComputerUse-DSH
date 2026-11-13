@@ -18,7 +18,7 @@ def window_identity(window):
 
 
 def monitor_signature(monitors):
-    return tuple(sorted((m.index,m.left,m.top,m.width,m.height,m.primary) for m in monitors))
+    return tuple(sorted((m.index,m.left,m.top,m.width,m.height,m.primary,getattr(m,"dpi_scale",None)) for m in monitors))
 
 
 def on_monitor(x,y,monitors):

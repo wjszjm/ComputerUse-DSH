@@ -5,6 +5,8 @@ import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {checkInstallation} from '../dsh-wdc-computer-use/lib/check-install.js';
+import {pluginVersion} from '../dsh-wdc-computer-use/lib/version.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runtime = path.join(root, '.runtime', 'node-tests', `${process.pid}-${Date.now()}`);
@@ -19,19 +21,23 @@ const displayChildren = [];
 const scenarios = [];
 const touched = [];
 let deniedWritePath;
+const packageFailureLog = path.join(root, 'dsh-wdc-computer-use', 'failures.log');
+const testFailureLog = path.join(runtime, 'failures.log');
 function checked(file) {
   const target = path.resolve(String(file));
   assert.ok(target.startsWith(runtime + path.sep) || target === runtime, `Non-test filesystem path: ${target}`);
   touched.push(target);
   return target;
 }
-mock.module('node:fs', {namedExports:Object.fromEntries(
-  ['mkdirSync','statSync','unlinkSync','writeFileSync'].map(name =>
+mock.module('node:fs', {namedExports:{
+  closeSync:fs.closeSync, fstatSync:fs.fstatSync, ftruncateSync:fs.ftruncateSync, writeSync:fs.writeSync,
+  ...Object.fromEntries(
+  ['mkdirSync','statSync','unlinkSync','writeFileSync','lstatSync','openSync'].map(name =>
     [name, (file,...args) => {
-      const target=checked(file);
-      if(name==='writeFileSync' && target===deniedWritePath) throw Object.assign(Error('mock access denied'),{code:'EACCES'});
+      const target=checked(path.resolve(file)===packageFailureLog?testFailureLog:file);
+      if((name==='writeFileSync'||name==='openSync')&&target===deniedWritePath)throw Object.assign(Error('mock access denied'),{code:'EACCES'});
       return fs[name](target,...args);
-    }]))});
+    }]))}});
 mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
   assert.equal(path.resolve(command), path.join(root,'.venv','Scripts','python.exe'));
   assert.equal(options.cwd, path.join(root,'win-desktop-control'));
@@ -65,7 +71,7 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
       }
       if (scenario.killName && scenario.killName === request.params?.name) { child.kill(); continue; }
       if ((scenario.hangMethod && scenario.hangMethod === request.method) || (scenario.hangName && scenario.hangName === request.params?.name) || scenario.hangNames?.includes(request.params?.name)) continue;
-      const result = request.method === 'initialize' ? {serverInfo:{name:'memory-server'}, instructions:'Mock safety instructions'}
+      const result = request.method === 'initialize' ? {serverInfo:{name:'memory-server',version:'1.0.0'}, instructions:'Mock safety instructions'}
         : request.method === 'tools/list' ? {tools:scenario.catalogMismatch ? [] : TOOL_CATALOG.tools}
         : (typeof scenario.callResult==='function'?scenario.callResult(request):scenario.callResult) || {content:[{type:'text',text:JSON.stringify({ok:true,action:request.params.name})}]};
       queueMicrotask(()=>{if(!child.killed) child.reply(request.id,result);});
@@ -91,7 +97,8 @@ test('bridge handshake, tool list and call use an in-memory child', async () => 
   const bridge = new McpBridge(options,()=>{});
   try {
     await bridge.start();
-    assert.equal((await bridge.listTools()).length,18);
+    assert.equal(children.at(-1).requests[0].params.clientInfo.version,pluginVersion);
+    assert.equal((await bridge.listTools()).length,24);
     const result = await bridge.callTool('type_text',{text:'memory only'});
     assert.equal(JSON.parse(result.content[0].text).action,'type_text');
   } finally { bridge.close(); }
@@ -116,7 +123,7 @@ for (const [profile,count] of [['minimal',9],['standard',14],['full',17]]) {
       })]);
       assert.equal(registered.length,count);
       assert.ok(registered.every(tool=>tool.name.startsWith('wdc_')));
-      const tool=registered.find(tool=>tool.name==='wdc_screenshot');
+      const tool=registered.find(tool=>tool.name==='wdc_wait');
       const result=await tool.execute({});
       assert.equal(result.ok,true);
       assert.equal(tool.output.render({},result)[0].type,'text');
@@ -163,7 +170,7 @@ test('read-only recovery is shared and stale exits cannot reject new requests', 
     const response=b.request('tools/list',{},1000);
     old.emit('exit',1,null);
     assert.equal(b.child,current);
-    assert.equal((await response).tools.length,18);
+    assert.equal((await response).tools.length,24);
   } finally { b.close(); }
 });
 
@@ -235,12 +242,112 @@ async function mounted(scenario,config={}) {
       callback({commands:{register(command){commands.set(command.name,command);}}});
       return;
     }
-    callback({tools:{register(tool){registered.push({...tool,execute:(args,exec=mockExec)=>tool.execute(args,exec)}); return ()=>{};}},effect(factory){cleanups.push(factory());}});
+    callback({tools:{register(tool){
+      if(tool.name===config.testRejectTool)throw new Error('private host error detail');
+      registered.push({...tool,execute:(args,exec=mockExec)=>tool.execute(args,exec)});return ()=>{};
+    }},effect(factory){cleanups.push(factory());}});
   }},{...options,stopFile:path.join(runtime,`mount-${++caseId}.flag`),statusPath:path.join(runtime,`mount-${caseId}.json`),...config});
   await done;
   assert.equal(typeof policy,'function','Cordis apply must return an effect disposer');
-  return {tools:registered,policy:policy.permissions,hooks,commands,attachPresets,close(){for(const cleanup of cleanups)cleanup();policy();}};
+  return {tools:registered,policy:policy.permissions,hooks,commands,attachPresets,close(){
+    for(const cleanup of cleanups)cleanup();
+    policy();
+    const pendingScenario=scenarios.indexOf(scenario);
+    if(pendingScenario>=0)scenarios.splice(pendingScenario,1);
+  }};
 }
+
+test('package failure log records only safe failure fields and tolerates write errors', async () => {
+  fs.rmSync(testFailureLog, {force:true});
+  const successful=await mounted({});
+  try {
+    assert.equal((await successful.tools.find(t=>t.name==='wdc_wait').execute({})).ok,true);
+  } finally {successful.close();}
+  assert.equal(fs.existsSync(testFailureLog),false);
+
+  const failed=await mounted({callResult:{content:[{type:'text',text:JSON.stringify({
+    ok:false,error_code:'arbitrary_secret_value',error:'private worker detail',
+  })}]}}, {testRejectTool:'wdc_click'});
+  try {
+    const wait=failed.tools.find(t=>t.name==='wdc_wait');
+    assert.equal((await wait.execute({})).ok,false);
+    const entries=fs.readFileSync(testFailureLog,'utf8').trim().split('\n').map(JSON.parse);
+    assert.ok(entries.every(entry=>Number.isFinite(Date.parse(entry.at))));
+    assert.deepEqual(entries.map(({at,...entry})=>entry),[
+      {stage:'registration',code:'registration_failed',tool:'click'},
+      {stage:'tool_result',code:'unknown_failure',tool:'wait'},
+    ]);
+    deniedWritePath=testFailureLog;
+    assert.equal((await wait.execute({})).ok,false);
+    assert.equal(fs.readFileSync(testFailureLog,'utf8').trim().split('\n').length,2);
+  } finally {
+    deniedWritePath=undefined;
+    failed.close();
+  }
+});
+
+test('version check distinguishes source, installed, and reported runtime versions', async () => {
+  const profileDir=path.join(runtime,'version-check');
+  const sourceDir=path.join(profileDir,'source');
+  const installedDir=path.join(profileDir,'node_modules','dsh-wdc-computer-use');
+  const statusPath=path.join(profileDir,'status.json');
+  const name='dsh-wdc-computer-use';
+  const write=(dir,value)=>{
+    fs.mkdirSync(dir,{recursive:true});
+    fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify(value));
+  };
+  write(profileDir,{dependencies:{[name]:'file:./source'},dsh:{profile:{bundles:[name]}}});
+  write(sourceDir,{name,version:pluginVersion});
+  write(installedDir,{name,version:'1.1.0'});
+  fs.writeFileSync(path.join(installedDir,'cordis.patch.yml'),'[]\n');
+  const m=await mounted({}, {statusPath});
+  try {
+    assert.equal((await m.tools.find(t=>t.name==='wdc_wait').execute({})).ok,true);
+    const status=JSON.parse(fs.readFileSync(statusPath,'utf8'));
+    assert.equal(status.versions.nodePlugin,pluginVersion);
+    assert.deepEqual(status.versions.pythonService,{version:'1.0.0',catalog:'matched'});
+    assert.deepEqual(checkInstallation(profileDir,statusPath).issues,[
+      'source_version_mismatch','runtime_different_package',
+    ]);
+    status.versions.pluginDirectory=installedDir;
+    fs.writeFileSync(statusPath,JSON.stringify(status));
+    const mismatch=checkInstallation(profileDir,statusPath);
+    assert.deepEqual(mismatch.issues,['source_version_mismatch','runtime_version_mismatch']);
+    assert.deepEqual(mismatch.python,{lastHandshakeVersion:'1.0.0',catalog:'matched'});
+    write(installedDir,{name,version:pluginVersion});
+    assert.equal(checkInstallation(profileDir,statusPath).ok,true);
+    fs.writeFileSync(statusPath,JSON.stringify({stage:'registered',pid:process.pid,ok:true}));
+    assert.deepEqual(checkInstallation(profileDir,statusPath).issues,['runtime_unversioned']);
+  } finally {m.close();}
+  assert.deepEqual(checkInstallation(profileDir,path.join(profileDir,'missing.json')).issues,['runtime_missing']);
+});
+
+test('host tool service can unload and register the plugin again',async()=>{
+  const cleanups=[], callbacks=new Map(), tools=new Map();
+  const statusPath=path.join(runtime,'tools-remount.json');
+  const applyContext={inject(deps,callback){callbacks.set(deps[0],callback);}};
+  const dispose=apply(applyContext,{...options,statusPath});
+  const scope={
+    tools:{register(tool){tools.set(tool.name,tool);return ()=>tools.delete(tool.name);}},
+    effect(factory){cleanups.push(factory());},
+  };
+  try {
+    callbacks.get('tools')(scope);
+    await tick();
+    assert.equal(tools.size,14);
+    const stale=tools.get('wdc_wait');
+    cleanups.shift()();
+    assert.equal(tools.size,0);
+    callbacks.get('tools')(scope);
+    await tick();
+    assert.equal(tools.size,14);
+    assert.equal((await stale.execute({},mockExec)).ok,false);
+    assert.equal((await tools.get('wdc_wait').execute({},mockExec)).ok,true);
+  } finally {
+    for(const cleanup of cleanups)cleanup();
+    dispose();
+  }
+});
 
 test('host sees legacy business errors as failures and safety controls cannot be hidden', async () => {
   const m=await mounted({callResult:{isError:false,content:[{type:'text',text:'{"ok":false,"error_code":"read_only"}'}]}},
@@ -455,14 +562,16 @@ test('window verification failure remains a failure without replay or a success 
   }finally{b.close();}
 });
 
-for (const mode of ['native','unavailable','write-error','resized']) test(`DSH screenshot delivery ${mode}`,async()=>{
+for (const mode of ['native','unavailable','write-error','resized','missing-frame']) test(`DSH screenshot delivery ${mode}`,async()=>{
   const data='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jG1sAAAAASUVORK5CYII=';
   let saved;
-  const m=await mounted({callResult:{content:[{type:'text',text:JSON.stringify({ok:true,frame_id:'frame-test'})},{type:'image',mimeType:'image/png',data}]}},
+  const m=await mounted({callResult:{content:[{type:'text',text:JSON.stringify({
+    ok:true,frame_id:'frame-test',image_size:mode==='missing-frame'?null:[1,1],
+  })},{type:'image',mimeType:'image/png',data}]}},
     {testAttachments:mode==='unavailable'?null:{async saveImage(input){
       saved=input;
       if(mode==='write-error')throw new Error('mock storage failure');
-      return mode==='resized'?{...imageRef,originalDimensions:{width:2,height:2}}:imageRef;
+      return mode==='resized'?{...imageRef,width:2}:imageRef;
     }}});
   const before=children.length;
   try {
@@ -472,7 +581,7 @@ for (const mode of ['native','unavailable','write-error','resized']) test(`DSH s
     if(mode==='unavailable'){
       assert.match(value.text,/image_delivery_unavailable/);
       assert.equal(children.length,before);
-    }else{
+    }else if(mode!=='missing-frame'){
       assert.deepEqual(saved,{data:Buffer.from(data,'base64'),mediaType:'image/png'});
       assert.equal(children.at(-1).requests.filter(q=>q.params?.name==='screenshot').length,1);
     }
@@ -485,8 +594,82 @@ for (const mode of ['native','unavailable','write-error','resized']) test(`DSH s
       assert.doesNotMatch(value.text,/frame-test/);
       if(mode==='write-error')assert.match(value.text,/image_delivery_failed/);
       if(mode==='resized')assert.match(value.text,/image_resized/);
+      if(mode==='missing-frame')assert.match(value.text,/invalid_screenshot_frame/);
     }
   } finally {m.close();}
+});
+
+test('frame-bound input waits until the native attachment has been delivered',async()=>{
+  let release, saving;
+  const started = new Promise(resolve=>{saving=resolve;});
+  const pendingAttachment = new Promise(resolve=>{release=resolve;});
+  const m=await mounted({callResult:request=>request.params.name==='screenshot' ? {
+    content:[{type:'text',text:'{"ok":true,"frame_id":"frame","image_size":[1,1]}'},
+      {type:'image',mimeType:'image/png',data:'AA=='}],
+  } : {content:[{type:'text',text:'{"ok":true}'}]}},
+  {testAttachments:{saveImage(){saving();return pendingAttachment;}}});
+  try {
+    const capture=m.tools.find(tool=>tool.name==='wdc_screenshot');
+    const click=m.tools.find(tool=>tool.name==='wdc_click');
+    const shot=capture.execute({});
+    await started;
+    const args={x:0,y:0,frame_id:'frame'};
+    assert.match((await click.execute(args)).text,/stale_frame/);
+    assert.match((await capture.execute({})).text,/action_busy/);
+    assert.equal(children.at(-1).requests.some(request=>request.params?.name==='click'),false);
+    release(imageRef);
+    assert.equal((await shot).ok,true);
+    assert.equal((await click.execute(args)).ok,true);
+  } finally {release(imageRef);m.close();}
+});
+
+test('a timed-out read retires its worker and a later read starts a new one',async()=>{
+  const bridge=faultBridge({hangName:'wait'},{callTimeoutMs:35});
+  try {
+    await assert.rejects(bridge.callTool('wait',{}),{code:'timeout'});
+    const previous=children.at(-1);
+    assert.equal(previous.killed,true);
+    await bridge.callTool('wait',{});
+    assert.notEqual(children.at(-1),previous);
+    assert.equal(previous.requests.filter(request=>request.params?.name==='wait').length,1);
+  } finally {bridge.close();}
+});
+
+test('unloading during input signals stop before giving Python time to release held inputs',async()=>{
+  const bridge=faultBridge({hangName:'type_text'});
+  await bridge.start();
+  const input=bridge.callTool('type_text',{text:'test input'});
+  const child=children.at(-1);
+  const request=child.requests.find(item=>item.params?.name==='type_text');
+  assert.ok(request);
+  bridge.close();
+  await assert.rejects(input,{code:'outcome_unknown'});
+  assert.equal(bridge.isStopped(),true);
+  assert.equal(child.killed,false);
+  child.reply(request.id,{content:[{type:'text',text:'{"ok":false,"error_code":"emergency_stop"}'}]});
+  await tick();
+  assert.equal(child.killed,true);
+});
+
+test('emergency stop cancels an attachment in another session and discards its late result',async()=>{
+  let saving, release;
+  const started=new Promise(resolve=>{saving=resolve;});
+  const attachment=new Promise(resolve=>{release=resolve;});
+  const m=await mounted({callResult:{content:[{type:'text',text:'{"ok":true,"frame_id":"frame","image_size":[1,1]}'},
+    {type:'image',mimeType:'image/png',data:'AA=='}]}},
+  {testAttachments:{saveImage(){saving();return attachment;}}});
+  try {
+    const screenshot=m.tools.find(tool=>tool.name==='wdc_screenshot');
+    const stop=m.tools.find(tool=>tool.name==='wdc_stop');
+    const pending=screenshot.execute({},execution('wdc_screenshot'));
+    await started;
+    assert.equal((await stop.execute({},execution('wdc_stop'))).ok,true);
+    const failure=await pending;
+    assert.match(failure.text,/operation_cancelled/);
+    assert.deepEqual(failure.images,undefined);
+    release(imageRef);
+    assert.equal((await m.tools.find(tool=>tool.name==='wdc_click').execute({x:0,y:0})).ok,false);
+  } finally {release(imageRef);m.close();}
 });
 
 test('DSH bridge repeatable isolated measurement',async()=>{
@@ -505,7 +688,7 @@ test('DSH bridge repeatable isolated measurement',async()=>{
       assert.equal(b.pending.size,0);
     }finally{b.close();}
   }
-  fs.writeFileSync(path.join(root,'.runtime','stage9-benchmark.json'),JSON.stringify({scope:'in-memory DSH bridge; excludes model, desktop, real transport and native display',reports},null,2));
+  fs.writeFileSync(path.join(runtime,'stage9-benchmark.json'),JSON.stringify({scope:'in-memory DSH bridge; excludes model, desktop, real transport and native display',reports},null,2));
 });
 
 const tick=()=>new Promise(setImmediate);
@@ -524,7 +707,7 @@ test('registration and local stop never spawn a worker; status separates registr
     const blocked=await m.tools.find(t=>t.name==='wdc_click').execute({x:1,y:2});
     assert.equal(blocked.ok,false);assert.match(blocked.text,/emergency_stop/);
     assert.equal(children.length,count);
-  }finally{m.close();scenarios.pop();}
+  }finally{m.close();}
 });
 
 test('simultaneous cold reads share one handshake, and idle time sends no desktop calls',async()=>{
@@ -655,7 +838,7 @@ for(const answer of ['rejected','cancelled','unavailable','unknown'])test(`appro
   try{
     const result=await m.tools.find(t=>t.name==='wdc_click').execute({x:1,y:2},execution());
     assert.equal(result.ok,false);assert.equal(children.length,before);assert.equal(displayChildren.length,displays);
-  }finally{m.close();scenarios.pop();}
+  }finally{m.close();}
 });
 
 test('older hosts without presets still ask per call before startup',async()=>{
@@ -832,7 +1015,7 @@ test('cancellation during approval ignores a late grant without starting workers
     const pending=m.tools.find(t=>t.name==='wdc_click').execute({x:1,y:2},exec);await tick();
     abort.abort();assert.equal((await pending).ok,false);answer('allowed-once');await tick();
     assert.equal(children.length,before);assert.equal(m.policy.active.size,0);
-  }finally{m.close();scenarios.pop();}
+  }finally{m.close();}
 });
 
 test('revocation during cold start prevents input dispatch',async()=>{

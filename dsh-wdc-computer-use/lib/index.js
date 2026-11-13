@@ -21,8 +21,11 @@ import { mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {FeedbackSession,summarizeFeedbackResult} from './feedback-session.js';
 import {NativeFeedbackHost} from './native-feedback-host.js';
-import {SessionPermissions} from './permissions.js';
+import {SessionPermissions, OBSERVATION_TOOLS} from './permissions.js';
 import {TOOL_CATALOG} from './tool-catalog.js';
+import {recordFailure} from './failure-log.js';
+import {pluginName, pluginVersion, versionLabel} from './version.js';
+import {mountSettings, optionalTools} from './settings.js';
 
 export const name = 'wdc-computer-use';
 export const inject = [];
@@ -30,19 +33,28 @@ export const inject = [];
 /** 默认不暴露的工具：run_command 需要服务端开 allow_shell，暴露它只是占上下文 */
 const DEFAULT_HIDDEN = ['run_command'];
 const CONTROL_TOOLS = new Set(['stop', 'resume']);
-const RETRY_SAFE_TOOLS = new Set(['screen_info', 'screenshot', 'list_windows', 'clipboard_get', 'wait']);
+const RETRY_SAFE_TOOLS = OBSERVATION_TOOLS;
+const IMAGE_TOOLS = new Set(['screenshot','window_screenshot']);
+const OPT_IN_TOOLS = optionalTools;
 
 function bridgeError(code, message, dispatched = false) {
   return Object.assign(new Error(message), { code, dispatched });
 }
 
-function toolSucceeded(result) {
-  if (!result || result.isError === true || !Array.isArray(result.content) || !result.content.length) return false;
+function toolFailureCode(result) {
+  if (!Array.isArray(result?.content) || !result.content.length) return 'tool_failed';
   for (const item of result.content) {
     if (item?.type !== 'text') continue;
-    try { if (JSON.parse(item.text)?.ok === false) return false; } catch { /* Ordinary text is allowed. */ }
+    try {
+      const value = JSON.parse(item.text);
+      if (value?.ok === false) return value.error_code || 'tool_failed';
+    } catch { /* Ordinary text is allowed. */ }
   }
-  return true;
+  return result.isError === true ? 'tool_failed' : undefined;
+}
+
+function toolSucceeded(result) {
+  return toolFailureCode(result) === undefined;
 }
 
 /**
@@ -70,6 +82,8 @@ const DEFAULTS = {
   cwd: path.resolve(import.meta.dirname, '../../win-desktop-control'),
   statusPath: path.resolve(import.meta.dirname, '../../.runtime/wdc-plugin-status.json'),
   stopFile: path.resolve(import.meta.dirname, '../../.runtime/wdc-stop.flag'),
+  stopHotkey: '',
+  screenshotScale: 0,
   /** Both display flags must be enabled explicitly before starting an own-process host. */
   feedbackEnabled: false,
   feedbackNativeEnabled: false,
@@ -89,6 +103,7 @@ const DEFAULTS = {
   approvalTimeoutMs: 60000,
   /** 不注册的工具名（服务端工具名，非 wdc_ 前缀名），用于给上下文减负 */
   hideTools: DEFAULT_HIDDEN,
+  enableTools: [],
   /** 是否精简 schema（去 title / 空默认值 / 截断超长描述） */
   pruneSchema: true,
   /** 工具档位：minimal | standard | full，决定注册哪些工具 */
@@ -254,6 +269,8 @@ function pickConfig(config) {
   }
   if (!Number.isFinite(out.idleTimeoutMs) || out.idleTimeoutMs < 1000 || out.idleTimeoutMs > 3600000) out.idleTimeoutMs = DEFAULTS.idleTimeoutMs;
   if (!Number.isFinite(out.approvalTimeoutMs) || out.approvalTimeoutMs < 1000 || out.approvalTimeoutMs > 300000) out.approvalTimeoutMs = 60000;
+  if (!['esc','ctrl+shift+f12'].includes(out.stopHotkey)) out.stopHotkey = '';
+  if (!Number.isFinite(out.screenshotScale) || out.screenshotScale < 0 || out.screenshotScale > 1) out.screenshotScale = 0;
   return out;
 }
 
@@ -273,9 +290,11 @@ class McpBridge {
     this.restarting = null;
     this.waking = null;
     this.ready = false;
+    this.pythonHandshake = null;
     this.activeCalls = 0;
     this.idleTimer = null;
     this.needsFreshFrame = false;
+    this.pendingImageDelivery = false;
     this.exits = new Map();
     this.activeMutations = 0;
     this.stopped = false;
@@ -330,7 +349,11 @@ class McpBridge {
     if (this.restarting) return this.restarting;
     if (this.waking) return this.waking;
     if (this.child) return this.starting;
-    const task = (async () => { await this.waitForExit(); return this.start(); })();
+    const task = (async () => {
+      if (this.waitForPreviousWorker) await this.waitForPreviousWorker();
+      await this.waitForExit();
+      return this.start();
+    })();
     this.waking = task;
     task.finally(() => { if (this.waking === task) this.waking = null; }).catch(() => {});
     return task;
@@ -356,6 +379,7 @@ class McpBridge {
     if (this.starting) return this.starting;
     if (this.exits.size) return Promise.reject(bridgeError('service_busy', '旧 WDC 进程尚未退出'));
     this.cancelIdle();
+    this.pythonHandshake = null;
     this.runtimeState('starting');
     const starting = new Promise((resolve, reject) => {
       let settled = false;
@@ -372,9 +396,11 @@ class McpBridge {
           cwd: this.options.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
-          env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', WDC_STOP_FILE: this.stopFile(), WDC_FEEDBACK_EVENTS: this.options.feedbackEnabled === true ? '1' : '0' },
+          env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', WDC_STOP_FILE: this.stopFile(),
+            WDC_STOP_HOTKEY:this.options.stopHotkey ?? '', WDC_FEEDBACK_EVENTS: this.options.feedbackEnabled === true ? '1' : '0' },
         });
       } catch (error) {
+        this.options.onFailure?.('python_start', 'service_start_failed');
         finish(error instanceof Error ? error : new Error(String(error)));
         return;
       }
@@ -384,6 +410,7 @@ class McpBridge {
       this.exits.set(child, new Promise(resolveExit => { exited = resolveExit; }));
 
       child.on('error', (error) => {
+        if (!this.closed && this.child === child) this.options.onFailure?.('python_process', 'transport_error');
         this.log(`子进程启动失败：${error instanceof Error ? error.message : String(error)}`);
         finish(error instanceof Error ? error : new Error(String(error)));
         this.retire(child, bridgeError('transport_error', 'WDC 子进程发生错误'));
@@ -391,6 +418,7 @@ class McpBridge {
 
       const onExit = (code, signal) => {
         if (!this.exits.has(child)) return;
+        if (!this.closed && this.child === child) this.options.onFailure?.('python_process', 'service_exited');
         const tail = this.stderrTail.slice(-5).join(' | ');
         this.log(`子进程退出 code=${code} signal=${signal}${tail ? `；stderr: ${tail}` : ''}`);
         exited();
@@ -425,7 +453,7 @@ class McpBridge {
       this.request('initialize', {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: 'dsh-wdc-computer-use', version: '1.0.0' },
+        clientInfo: {name:pluginName, version:pluginVersion},
       }, this.options.initTimeoutMs)
         .then(async (result) => {
           if (this.closed || this.child !== child) throw bridgeError('service_exited', '握手进程已失效');
@@ -433,6 +461,7 @@ class McpBridge {
           // 这段 instructions 是给模型的用法指导，不能丢——宿主没有系统提示注入点，
           // 后面会把它附到 screenshot 工具的描述里。
           this.instructions = typeof result?.instructions === 'string' ? result.instructions : '';
+          const pythonVersion = versionLabel(result?.serverInfo?.version);
           if (this.options.expectedTools) {
             const actual = await this.listTools();
             for (const expected of this.options.expectedTools) {
@@ -440,11 +469,16 @@ class McpBridge {
               const keys = schema => Object.keys(schema?.properties || {}).sort().join(',');
               const required = schema => [...(schema?.required || [])].sort().join(',');
               if (!found || keys(found.inputSchema) !== keys(expected.inputSchema) || required(found.inputSchema) !== required(expected.inputSchema)) {
+                if (!this.closed && this.child === child) this.pythonHandshake = {version:pythonVersion, catalog:'mismatch'};
                 throw bridgeError('catalog_mismatch', '服务工具定义与安装包不一致，请更新配套安装包。');
               }
             }
           }
           if (this.closed || this.child !== child) throw bridgeError('bridge_closed', '握手期间服务已关闭');
+          this.pythonHandshake = {
+            version:pythonVersion,
+            catalog: this.options.expectedTools ? 'matched' : 'unchecked',
+          };
           this.ready = true;
           this.log(`握手成功：${JSON.stringify(result?.serverInfo ?? {})}，instructions ${this.instructions.length} 字符`);
           this.feedbackInvoke('setTransportAvailable',true);
@@ -453,6 +487,7 @@ class McpBridge {
           finish();
         })
         .catch((error) => {
+          if (!this.closed && this.child === child) this.options.onFailure?.('python_handshake', error.code || 'initialization_failed');
           this.log(`握手失败：${error instanceof Error ? error.message : String(error)}`);
           finish(error instanceof Error ? error : new Error(String(error)));
           this.retire(child, error);
@@ -508,7 +543,9 @@ class McpBridge {
       // Late completion resolves uncertainty, but never clears the stop latch.
       if (this.inDoubt.get(id) === child && (message.error || Object.hasOwn(message, 'result'))) {
         this.inDoubt.delete(id);this.refreshFeedbackControl();
-        this.scheduleIdle();
+        if (this.closed && this.child === child && !this.inDoubt.size) {
+          this.retire(child, bridgeError('bridge_closed', 'WDC 桥已关闭'));
+        } else this.scheduleIdle();
       }
       return;
     }
@@ -538,7 +575,11 @@ class McpBridge {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         if (entry.dispatched && entry.mutating) this.inDoubt.set(id, child);
-        entry.reject(bridgeError('timeout', `MCP ${method} 超时（${timeoutMs}ms）`, true));
+        entry.reject(bridgeError('timeout', `MCP ${method} 超时（${timeoutMs}ms）`, entry.dispatched));
+        if (method === 'tools/call' && RETRY_SAFE_TOOLS.has(params?.name) &&
+            this.child === child && !this.activeMutations && !this.inDoubt.size) {
+          this.retire(child, bridgeError('service_exited', 'WDC 读取超时，已回收无响应的服务'));
+        }
       }, timeoutMs ?? this.options.callTimeoutMs);
       const entry = { resolve, reject, timer, child, feedbackToken, pointerSequence:0, dispatched: false,
         mutating: method === 'tools/call' && !RETRY_SAFE_TOOLS.has(params?.name) && !CONTROL_TOOLS.has(params?.name) };
@@ -549,7 +590,7 @@ class McpBridge {
         if(this.pending.get(id)!==entry)return;
         this.pending.delete(id);clearTimeout(timer);
         if(entry.dispatched&&entry.mutating)this.inDoubt.set(id,child);
-        if(method==='tools/call'&&!RETRY_SAFE_TOOLS.has(params?.name))try{this.latchStop();}catch{}
+        if(entry.dispatched&&entry.mutating)try{this.latchStop();}catch{}
         entry.reject(bridgeError('operation_cancelled','操作已取消；已发出的输入须核对结果。',entry.dispatched));
       };
       this.pending.set(id, entry);
@@ -651,12 +692,19 @@ class McpBridge {
       lease?.check();
       // A stop arriving during cold start must win before any input is dispatched.
       if (mutating && this.isStopped()) throw bridgeError('emergency_stop', '启动期间已停止；未发送输入。');
-      if (this.needsFreshFrame && ['click','move_mouse','drag','scroll'].includes(toolName) && (args?.coordinate_mode ?? 'auto') !== 'screen') {
-        throw bridgeError('stale_frame', '服务已重新启动，请先重新截图，不能复用旧图坐标。');
+      const usesFrame = args?.frame_id || (['click','move_mouse','drag','scroll'].includes(toolName) &&
+        (args?.coordinate_mode ?? 'auto') !== 'screen');
+      if (usesFrame && (this.needsFreshFrame || this.pendingImageDelivery)) {
+        throw bridgeError('stale_frame', '需要已成功交付的截图才能使用图像坐标，请重新观察。');
       }
       inputRequestStarted = true;
       const result = await this.request('tools/call', { name: toolName, arguments: args ?? {} }, this.options.callTimeoutMs, feedbackToken, lease);
-      if (toolName === 'screenshot' && toolSucceeded(result)) this.needsFreshFrame = false;
+      if (mutating && toolFailureCode(result) === 'emergency_stop') {
+        try { this.latchStop(); }
+        catch { this.options.onFailure?.('tool_call','stop_signal_failed',toolName); }
+        finally { this.options.onEmergencyStop?.(); }
+      }
+      if (IMAGE_TOOLS.has(toolName) && toolSucceeded(result)) this.needsFreshFrame = false;
       return result;
     } catch (error) {
       if (this.closed && !inputRequestStarted) throw bridgeError('bridge_closed', 'WDC 桥已关闭，未发送操作。');
@@ -699,6 +747,7 @@ class McpBridge {
       return Promise.reject(bridgeError('action_busy', '仍有结果未知的输入操作，禁止强制重启服务。'));
     }
     const task = (async () => {
+      if (this.waitForPreviousWorker) await this.waitForPreviousWorker();
       if (this.child) this.retire(this.child, bridgeError('service_exited', 'WDC 服务重启中'));
       const waits = [...this.exits.values()];
       if (waits.length) {
@@ -717,15 +766,36 @@ class McpBridge {
   }
 
   close() {
+    if (this.closed) return;
     this.closed = true;
     this.cancelIdle();
     this.feedbackInvoke('dispose');
+    if (this.child && (this.activeMutations || this.inDoubt.size)) {
+      try { this.latchStop(); } catch { /* Keep the in-memory stop even if disk is unavailable. */ }
+      // Let Python unwind and release its held inputs before terminating it.
+      const child = this.child;
+      this.rejectPending(child, bridgeError('bridge_closed', 'WDC 桥已关闭'));
+      this.closeAfterInput(child);
+      return;
+    }
     this.retire(this.child, bridgeError('bridge_closed', 'WDC 桥已关闭'));
+  }
+
+  closeAfterInput(child) {
+    if (![...this.inDoubt.values()].includes(child)) {
+      this.retire(child, bridgeError('bridge_closed', 'WDC 桥已关闭'));
+      return;
+    }
+    const timeout = setTimeout(() => {
+      if (this.child === child) this.retire(child, bridgeError('bridge_closed', 'WDC 桥已关闭'));
+    }, 1000);
+    child.once('close', () => clearTimeout(timeout));
+    child.once('exit', () => clearTimeout(timeout));
   }
 }
 
 /** 把 MCP 返回的 content 数组转成 DSH 工具结果 */
-async function toHostContent(result, attachments) {
+async function toHostContent(result, attachments, expectedImageSize) {
   const items = Array.isArray(result?.content) ? result.content : [];
   const parts = [];
   for (const item of items) {
@@ -739,12 +809,15 @@ async function toHostContent(result, attachments) {
       try {
         const data = Buffer.from(item.data, 'base64');
         attachment = await attachments.saveImage({data, mediaType: item.mimeType});
-        if (!attachment?.attachmentId || !attachment.width || !attachment.height) throw new Error('Invalid image reference');
+        if (typeof attachment?.attachmentId !== 'string' || !attachment.attachmentId ||
+            !Number.isSafeInteger(attachment.width) || attachment.width <= 0 ||
+            !Number.isSafeInteger(attachment.height) || attachment.height <= 0) throw new Error('Invalid image reference');
       } catch {
         throw bridgeError('image_delivery_failed', 'DSH 未能接收截图。请检查附件服务，或缩小截图区域后重试。');
       }
       const original = attachment.originalDimensions;
-      if (original && (original.width !== attachment.width || original.height !== attachment.height)) {
+      if ((original && (original.width !== attachment.width || original.height !== attachment.height)) ||
+          (expectedImageSize && (expectedImageSize[0] !== attachment.width || expectedImageSize[1] !== attachment.height))) {
         throw bridgeError('image_resized', 'DSH 缩放了截图，图像坐标已失效。请用较小的区域或 scale 重新截图。');
       }
       parts.push({type:'image', attachment});
@@ -756,6 +829,36 @@ async function toHostContent(result, attachments) {
     parts.push({ type: 'text', text: result === undefined ? '(无返回)' : JSON.stringify(result) });
   }
   return parts;
+}
+
+async function convertToolResult(result, attachments, imageSize, lease, timeoutMs) {
+  if (!imageSize) return toHostContent(result, attachments);
+  lease?.check();
+  let timer, abort;
+  const interrupted = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(bridgeError('image_delivery_timeout', 'DSH 附件交付超时，请重新截图。')), timeoutMs);
+    abort = () => reject(bridgeError('operation_cancelled', '截图交付已取消。'));
+    lease?.signal.addEventListener('abort', abort, {once:true});
+  });
+  try {
+    return await Promise.race([interrupted, toHostContent(result, attachments, imageSize)]);
+  } finally {
+    clearTimeout(timer);
+    lease?.signal.removeEventListener('abort', abort);
+  }
+}
+
+function screenshotSize(result) {
+  for (const item of result.content) {
+    if (item?.type !== 'text') continue;
+    let data;
+    try { data = JSON.parse(item.text); } catch { continue; }
+    if (typeof data?.frame_id !== 'string' || !data.frame_id) continue;
+    if (Array.isArray(data.image_size) && data.image_size.length === 2 &&
+        data.image_size.every(value => Number.isSafeInteger(value) && value > 0) &&
+        result.content.filter(part => part?.type === 'image').length === 1) return data.image_size;
+  }
+  throw bridgeError('invalid_screenshot_frame', '截图缺少可验证的图像或坐标帧，请重新观察。');
 }
 
 /** Tool result schema: loose object so the host does not over-validate */
@@ -788,6 +891,7 @@ export function apply(ctx, config) {
   // 每次挂载独立记账：模块级共享会让插件卸载后重载时误判"已注册过"而全部跳过
   const manifest = [];
   const options = pickConfig(config);
+  options.onFailure = recordFailure;
   const statusPath = options.statusPath;
   const log = (message) => {
     try {
@@ -799,19 +903,39 @@ export function apply(ctx, config) {
 
   let injectedPresets;
   const getPresets = () => injectedPresets ?? ctx.get?.('permissionPresets');
-  const permissions = new SessionPermissions({
+  const createPermissions = () => new SessionPermissions({
     mode:options.permissionMode,
     timeoutMs:options.approvalTimeoutMs,
     rememberApprovals:options.rememberSessionApprovals,
     getApproval:() => ctx.get?.('approval'),
     getPresets,
   });
-  const bridge = new McpBridge(options, log);
-  bridge.instructions = TOOL_CATALOG.instructions;
-  options.expectedTools = TOOL_CATALOG.tools;
+  let permissions = createPermissions();
+  options.onEmergencyStop = () => permissions.stopAll();
+  function createBridge(previous) {
+    const instance = new McpBridge(options, log);
+    if (previous) instance.waitForPreviousWorker = async () => {
+      await previous.waitForPreviousWorker?.();
+      await previous.waitForExit();
+      instance.waitForPreviousWorker = undefined;
+    };
+    instance.instructions = TOOL_CATALOG.instructions;
+    return instance;
+  }
+  options.expectedTools = TOOL_CATALOG.tools.filter(tool =>
+    !OPT_IN_TOOLS.has(tool.name) || options.enableTools.includes(tool.name));
+  let bridge = createBridge();
+  async function stopAll() {
+    try { return await bridge.callTool('stop', {}); }
+    finally { permissions.stopAll(); }
+  }
   let statusPayload={ok:false,stage:'apply-called',note:'插件已加载，等待 tools 服务'};
   let statusClosed=false;
-  let nativeDisplay=new NativeFeedbackHost(options,bridge.feedback,log,()=>reportStatus({}));
+  function onDisplayStatus(status) {
+    if (status.state === 'failed') recordFailure('desktop_feedback', status.reason);
+    reportStatus({});
+  }
+  let nativeDisplay=new NativeFeedbackHost(options,bridge.feedback,log,onDisplayStatus);
   let displayClosing=Promise.resolve(true), displayStarting=null, executions=0;
   options.onRuntimeState = runtime => reportStatus({runtime});
   async function startDisplay() {
@@ -820,7 +944,7 @@ export function apply(ctx, config) {
     const task = (async () => {
       const exited = await displayClosing;
       if (!exited || statusClosed || !executions) return;
-      if (nativeDisplay.closed) nativeDisplay=new NativeFeedbackHost(options,bridge.feedback,log,()=>reportStatus({}));
+      if (nativeDisplay.closed) nativeDisplay=new NativeFeedbackHost(options,bridge.feedback,log,onDisplayStatus);
       nativeDisplay.start();
       await nativeDisplay.readyWait;
     })();
@@ -832,6 +956,16 @@ export function apply(ctx, config) {
     statusPayload={...statusPayload,...update};
     writeStatus(statusPath,{
       ...statusPayload,
+      compatibility:{
+        tools:typeof ctx.get?.('tools')?.register === 'function' || manifest.length > 0,
+        attachments:typeof ctx.get?.('attachments')?.saveImage === 'function',
+        approval:typeof ctx.get?.('approval')?.request === 'function',
+      },
+      versions:{
+        nodePlugin:pluginVersion,
+        pluginDirectory:path.resolve(import.meta.dirname, '..'),
+        pythonService:bridge.pythonHandshake,
+      },
       nativeFeedback:nativeDisplay.status(),
       permissionIntegration:{
         hostPresetsAvailable:typeof getPresets()?.current === 'function',
@@ -841,6 +975,15 @@ export function apply(ctx, config) {
   }
 
   reportStatus({});
+  mountSettings(ctx,options,()=>statusPayload,()=>executions>0 || bridge.activeMutations>0 || bridge.inDoubt.size>0);
+
+  ctx.inject(['attachments'], (attachmentCtx) => {
+    if (typeof attachmentCtx.attachments?.saveImage !== 'function') return;
+    attachmentCtx.effect(() => {
+      reportStatus({});
+      return () => reportStatus({});
+    });
+  });
 
   // Optional host service. Tools may register before the preset service starts.
   ctx.inject(['permissionPresets'], (presetCtx) => {
@@ -878,11 +1021,11 @@ export function apply(ctx, config) {
         if (!invocation.agent?.session || invocation.signal?.aborted) {
           return {kind:'error', text:'电脑操作权限命令需要有效的 DSH 会话。'};
         }
-        permissions.revoke(invocation.agent.session);
         try {
-          await bridge.callTool('stop', {});
-          return {kind:'success', text:'已停止电脑操作并撤销本会话的插件授权。'};
+          await stopAll();
+          return {kind:'success', text:'已停止电脑操作并撤销所有会话的插件授权。'};
         } catch {
+          recordFailure('tool_call', 'stop_signal_failed', 'stop');
           return {kind:'error', text:'停止信号写入失败，插件已阻止后续输入。'};
         }
       },
@@ -892,11 +1035,20 @@ export function apply(ctx, config) {
   ctx.inject(['tools'], (toolsCtx) => {
     const tools = toolsCtx?.tools;
     if (!tools || typeof tools.register !== 'function') {
+      recordFailure('registration', 'tools_unavailable');
       log('宿主未提供 tools 服务，插件不挂载任何工具');
       reportStatus({ ok: false, stage: 'tools-unavailable', error: '宿主未提供 tools 服务' });
       return;
     }
 
+    if (statusClosed) {
+      permissions = createPermissions();
+      bridge = createBridge(bridge);
+      nativeDisplay = new NativeFeedbackHost(options,bridge.feedback,log,onDisplayStatus);
+      statusClosed = false;
+    }
+    const currentBridge = bridge;
+    const currentPermissions = permissions;
     let disposed = false;
     const disposers = [];
 
@@ -912,7 +1064,9 @@ export function apply(ctx, config) {
         let skipped = 0;
         const failedTools = [];
         for (const tool of list) {
-          if (!CONTROL_TOOLS.has(tool.name) && (hidden.has(tool.name) || (allowSet && !allowSet.has(tool.name)))) {
+          const enabled = options.enableTools.includes(tool.name);
+          if (!CONTROL_TOOLS.has(tool.name) && (hidden.has(tool.name) ||
+              (OPT_IN_TOOLS.has(tool.name) ? !enabled : (!enabled && allowSet && !allowSet.has(tool.name))))) {
             skipped += 1;
             continue;
           }
@@ -949,52 +1103,81 @@ export function apply(ctx, config) {
                 },
               },
               async execute(args,exec) {
-                const input = args && typeof args === 'object' ? args : {};
+                let input = args && typeof args === 'object' ? args : {};
+                if (IMAGE_TOOLS.has(tool.name) && input.scale === undefined && options.screenshotScale) {
+                  input = {...input,scale:options.screenshotScale};
+                }
                 let lease;
                 try {
-                  if (tool.name === 'stop') permissions.revoke(exec?.agent?.session);
-                  else lease = await permissions.acquire(tool.name, exec, hostName);
+                  if (disposed) throw bridgeError('bridge_closed', 'WDC 桥已关闭');
+                  if (tool.name !== 'stop') lease = await currentPermissions.acquire(tool.name, exec, hostName);
                 } catch (error) {
                   const code = error.code || 'approval_error';
+                  recordFailure('approval', code, tool.name);
                   const message = /^(permission_|approval_unavailable$|operation_cancelled$)/.test(code)
                     ? error.message : '电脑操作未获授权或已取消';
                   return {ok:false,text:JSON.stringify({ok:false,error_code:code,error:message})};
                 }
                 executions += 1;
+                let ownsImageDelivery = false;
                 try {
                 // Stop is local and immediate, even while Python/display is starting.
                 const attachments = toolsCtx.get?.('attachments') ?? ctx.get?.('attachments');
-                if (tool.name === 'screenshot' && typeof attachments?.saveImage !== 'function') {
+                if (IMAGE_TOOLS.has(tool.name) && typeof attachments?.saveImage !== 'function') {
+                  recordFailure('attachment', 'image_delivery_unavailable', tool.name);
                   return {ok:false,text:JSON.stringify({ok:false,error_code:'image_delivery_unavailable',
                     error:'此 DSH 未提供原生附件服务，暂无法交付截图。'})};
                 }
+                if (IMAGE_TOOLS.has(tool.name)) {
+                  if (currentBridge.pendingImageDelivery) {
+                    return {ok:false,text:JSON.stringify({ok:false,error_code:'action_busy',error:'上一张截图尚未完成交付。'})};
+                  }
+                  ownsImageDelivery = currentBridge.pendingImageDelivery = true;
+                  currentBridge.needsFreshFrame = true;
+                }
                 if (tool.name !== 'stop') await startDisplay();
                 let result;
-                try { lease?.check();result = await bridge.callTool(tool.name, input,true,lease); }
+                try {
+                  lease?.check();
+                  result = tool.name === 'stop' ? await stopAll() : await currentBridge.callTool(tool.name, input,true,lease);
+                }
                 catch (error) {
+                  recordFailure('tool_call', error.code || 'bridge_error', tool.name);
                   return {ok:false,text:JSON.stringify({ok:false,action:tool.name,error_code:error.code || 'bridge_error',error:error.message})};
                 }
                 let content;
-                try { content = await toHostContent(result, attachments); lease?.check(); }
+                const failureCode = toolFailureCode(result);
+                try {
+                  const imageSize = ownsImageDelivery && failureCode === undefined ? screenshotSize(result) : undefined;
+                  const convertible = failureCode === undefined ? result : {
+                    content:Array.isArray(result?.content) ? result.content.filter(item => item?.type === 'text') : [],
+                  };
+                  content = await convertToolResult(convertible, attachments, imageSize, lease, options.callTimeoutMs);
+                  lease?.check();
+                }
                 catch (error) {
-                  if (tool.name === 'screenshot') bridge.needsFreshFrame = true;
+                  if (IMAGE_TOOLS.has(tool.name)) currentBridge.needsFreshFrame = true;
+                  recordFailure('tool_result', error.code || 'result_conversion_failed', tool.name);
                   return {ok:false,text:JSON.stringify({ok:false,action:tool.name,error_code:error.code || 'result_conversion_failed',error:error.message})};
                 }
                 const text = content
                   .filter(item => item.type === 'text')
                   .map(item => item.text)
                   .join('\n');
-                return {ok:toolSucceeded(result), text, images:content.filter(item => item.type === 'image')};
+                if (failureCode !== undefined) recordFailure('tool_result', failureCode, tool.name);
+                return {ok:failureCode === undefined, text, images:content.filter(item => item.type === 'image')};
                 } finally {
+                  if (ownsImageDelivery) currentBridge.pendingImageDelivery = false;
                   lease?.release();
                   executions -= 1;
-                  if (!executions) displayClosing=nativeDisplay.close();
+                  if (!executions && !disposed) displayClosing=nativeDisplay.close();
                 }
               },
             });
             if (typeof dispose === 'function') disposers.push(dispose);
             manifest.push({ name: hostName, source: tool.name });
           } catch (error) {
+            recordFailure('registration', 'registration_failed', tool.name);
             failedTools.push(hostName);
             log(`注册工具 ${hostName} 失败：${error instanceof Error ? error.message : String(error)}`);
           }
@@ -1016,6 +1199,7 @@ export function apply(ctx, config) {
       })
       .catch((error) => {
         if(disposed)return;
+        recordFailure('registration', 'initialization_failed');
         nativeDisplay.close();
         const message = error instanceof Error ? error.message : String(error);
         log(`初始化未完成，本次不提供桌面工具：${message}`);
@@ -1024,7 +1208,7 @@ export function apply(ctx, config) {
 
     toolsCtx.effect(() => () => {
       disposed = true;
-      permissions.close();
+      currentPermissions.close();
       for (const dispose of disposers.splice(0)) {
         try {
           dispose();
@@ -1032,9 +1216,10 @@ export function apply(ctx, config) {
           /* ignore */
         }
       }
-      nativeDisplay.close();
+      manifest.length = 0;
+      displayClosing = nativeDisplay.close();
       reportStatus({ok:false,stage:'disposed',registered:0,tools:[]});statusClosed=true;
-      bridge.close();
+      currentBridge.close();
     });
   });
   // Cordis requires an effect disposer, not an arbitrary service object.

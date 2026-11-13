@@ -7,5 +7,5 @@ const lib=path.join(root,'dsh-wdc-computer-use/lib');
 // No third-party build dependency: the browser entry uses only injected services.
 const policy=fs.readFileSync(path.join(lib,'client-policy.js'),'utf8').replace(/^export /gm,'');
 const entry=fs.readFileSync(path.join(lib,'client-entry.js'),'utf8').replace(/^import .*;\r?\n/gm,'').replace(/^export /gm,'');
-const bundle=`window.__ModuleLoader__.load({id:'dsh-wdc-computer-use',factory:()=>{\nconst TOOL_CATALOG=${JSON.stringify({tools:TOOL_CATALOG.tools.map(({name})=>({name}))})};\n${policy}\n${entry}\nreturn {inject,apply};\n}});\n`;
+const bundle=`window.__ModuleLoader__.load({id:'dsh-wdc-computer-use',factory:require=>{\nconst TOOL_CATALOG=${JSON.stringify({tools:TOOL_CATALOG.tools.map(({name})=>({name}))})};\n${policy}\n${entry}\nreturn {inject,apply:(ctx,config)=>apply(ctx,config,typeof require==='function'?require('react'):undefined)};\n}});\n`;
 fs.writeFileSync(path.join(lib,'client.js'),bundle);

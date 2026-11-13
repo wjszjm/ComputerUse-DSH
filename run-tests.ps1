@@ -16,7 +16,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Python tests failed: $LASTEXITCODE" }
     & node scripts/build-client.mjs
     if ($LASTEXITCODE -ne 0) { throw 'Client build failed' }
-    & node --experimental-test-module-mocks --test test_support/client-policy.test.mjs test_support/plugin.test.mjs test_support/visual-feedback.test.mjs test_support/visual-preview.test.mjs test_support/feedback-session.test.mjs test_support/native-feedback-host.test.mjs
+    & npm run test:node
     if ($LASTEXITCODE -ne 0) { throw "Node tests failed: $LASTEXITCODE" }
 } finally {
     Pop-Location

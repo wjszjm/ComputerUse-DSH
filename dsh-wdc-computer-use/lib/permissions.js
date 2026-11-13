@@ -1,5 +1,9 @@
 /** Grants belong to DSH session objects and never come from tool arguments. */
-const READS = new Set(['screen_info', 'screenshot', 'list_windows', 'clipboard_get', 'wait']);
+export const OBSERVATION_TOOLS = new Set([
+  'screen_info','screenshot','list_windows','clipboard_get','wait',
+  'window_screenshot','inspect_controls','recognize_text','locate_target',
+]);
+const READS = OBSERVATION_TOOLS;
 const MODES = new Set(['ask', 'autonomous', 'read-only', 'disabled']);
 const PERMISSION_EVENTS = new Set(['permission/preset', 'approval/policy', 'sandbox/mode']);
 export const permissionError = (code, message) => Object.assign(new Error(message), {code});
@@ -25,30 +29,37 @@ export class SessionPermissions {
     this.sessions = new WeakMap();
     this.preflights = new WeakMap();
     this.active = new Set();
+    this.stopGeneration = 0;
     this.closed = false;
   }
 
   state(session) {
     let state = this.sessions.get(session);
     if (!state) {
-      state = {mode:this.mode, version:0, grants:new Set(), pending:new Map()};
+      state = {mode:this.mode, version:0, stopGeneration:this.stopGeneration, grants:new Set(), pending:new Map()};
       this.sessions.set(session, state);
+    }
+    if (state.stopGeneration !== this.stopGeneration) {
+      state.stopGeneration = this.stopGeneration;
+      state.version += 1;
+      state.grants.clear();
+      state.pending.clear();
     }
     return state;
   }
 
   hostAccess(session) {
-    const policy = this.getApproval()?.effectivePolicy?.(session);
-    const service = this.getPresets();
-    let preset, sandbox, autoLive = false;
+    let policy, preset, sandbox, autoLive = false;
     try {
+      policy = this.getApproval()?.effectivePolicy?.(session);
+      const service = this.getPresets();
       preset = service?.current?.(session);
       sandbox = service?.permissionState?.(session)?.sandbox;
       if (!sandbox && preset && preset !== 'custom') sandbox = service.resolve?.(preset)?.sandbox;
       autoLive = preset === 'auto' && service.names?.includes('auto') === true;
     } catch {
-      // A missing or not-yet-ready host service cannot grant elevated access.
-      preset = undefined;
+      // A failing permission service can no longer establish the policy.
+      preset = 'disabled';
       autoLive = false;
     }
     return {preset, sandbox, policy, autoLive, key:JSON.stringify([preset, sandbox, policy, autoLive])};
@@ -76,6 +87,11 @@ export class SessionPermissions {
 
   onSessionEvent(session, event) {
     if (PERMISSION_EVENTS.has(event?.type)) this.revoke(session);
+  }
+
+  stopAll() {
+    this.stopGeneration += 1;
+    for (const lease of this.active) lease.controller.abort();
   }
 
   setMode(session, mode) {
