@@ -1,3 +1,5 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+
 const route = '/api/computeruse-dsh/settings';
 const packageName = 'dsh-wdc-computer-use';
 const profiles = new Set(['minimal','standard','full']);
@@ -11,6 +13,7 @@ const selectableBaseTools = new Set([
 ]);
 
 export function mountSettings(ctx, options, snapshot, isBusy) {
+  const writeToken = randomBytes(24).toString('hex');
   ctx.inject(['webServer','connection','configEditor'], scope => {
     const server = scope.get?.('webServer');
     const connection = scope.get?.('connection');
@@ -32,6 +35,7 @@ export function mountSettings(ctx, options, snapshot, isBusy) {
       if (req.method === 'GET') {
         const current=snapshot();
         send(200,{
+          writeToken,
           profile:options.profile,enableTools:options.enableTools.filter(tool=>optionalTools.has(tool)),
           disabledTools:options.hideTools.filter(tool=>selectableBaseTools.has(tool)),
           feedbackEnabled:options.feedbackEnabled && options.feedbackNativeEnabled,
@@ -45,7 +49,11 @@ export function mountSettings(ctx, options, snapshot, isBusy) {
         send(405,{error:'不支持的设置请求。'});
         return;
       }
-      if (fetchSite !== 'same-origin') {
+      // DSH Desktop strips browser provenance headers when forwarding its own app origin.
+      const suppliedToken=req.headers['x-dsh-settings-token'];
+      if ((fetchSite!==undefined && fetchSite!=='same-origin') ||
+          typeof suppliedToken!=='string' || !/^[0-9a-f]{48}$/u.test(suppliedToken) ||
+          !timingSafeEqual(Buffer.from(suppliedToken),Buffer.from(writeToken))) {
         send(403,{error:'设置只能从 DSH 界面保存。'});
         return;
       }

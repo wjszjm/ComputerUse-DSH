@@ -11,6 +11,12 @@ const baseSettingsTools = {
   type_text:'输入文字',press_key:'按键',scroll:'滚动',list_windows:'列出窗口',
   activate_window:'激活窗口',window_action:'窗口操作',clipboard_get:'读取剪贴板',wait:'等待',
 };
+const settingsId='computeruse-dsh';
+const settingsGroup={margin:0,padding:'16px',border:'1px solid color-mix(in srgb, currentColor 20%, transparent)',borderRadius:12};
+const settingsRow={display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,minHeight:32};
+const settingsGrid={display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(min(100%, 168px), 1fr))',gap:'8px 16px'};
+const runtimeLabels={dormant:'休眠',idle:'待命',active:'运行中',starting:'启动中',stopping:'正在停止',failed:'启动失败'};
+const permissionLabels={ask:'按需审批',autonomous:'按宿主授权执行','read-only':'只读',disabled:'已停用'};
 
 function registerSettings(slots, react) {
   if (!react) return;
@@ -19,59 +25,83 @@ function registerSettings(slots, react) {
     const endpoint=new URL('api/computeruse-dsh/settings',document.baseURI);
     const response=await fetch(endpoint,{
       method:payload?'POST':'GET',credentials:'same-origin',signal,
-      headers:{'x-dsh-plugin':'dsh-wdc-computer-use',...(payload?{'content-type':'application/json'}:{})},
-      body:payload?JSON.stringify(payload):undefined,
+      headers:{'x-dsh-plugin':'dsh-wdc-computer-use',...(payload?{'content-type':'application/json','x-dsh-settings-token':payload.writeToken}:{})},
+      body:payload?JSON.stringify(payload, (key,value)=>key==='writeToken'?undefined:value):undefined,
     });
     if (!response.headers.get('content-type')?.includes('application/json')) throw new Error('DSH 设置接口不可用。');
     const data=await response.json();
     if (!response.ok) throw new Error(data.error || 'DSH 设置接口不可用。');
     return data;
   };
-  slots.inject('plugins.bundle.config',()=>slots.register({
-    name:'plugins.bundle.config',key:'dsh-wdc-computer-use',
-  },function ComputerUseSettings(){
+  function ComputerUseSettings({standalone=false}={}) {
     const [draft,update]=useState(null);
+    const [baseline,setBaseline]=useState(null);
     const [message,show]=useState('正在读取设置');
     const [busy,setBusy]=useState(false);
+    const [reload,setReload]=useState(0);
     useEffect(()=>{
       const controller=new AbortController();
-      call(null,controller.signal).then(data=>{update(data);show('');},
+      call(null,controller.signal).then(data=>{if(!controller.signal.aborted){update(data);setBaseline(data);show('');}},
         error=>{if(!controller.signal.aborted)show(error.message);});
       return ()=>controller.abort();
-    },[]);
-    if (!draft) return h('p',{role:'status'},message);
+    },[reload]);
+    const header=standalone?h('header',null,h('h2',{style:{margin:'0 0 6px'}},'电脑操控（Computer Use）'),
+      h('p',{style:{margin:0,opacity:0.75}},'管理 DSH 的 Windows 桌面操作。')):null;
+    if (!draft) return h('section',null,header,h('p',{role:'status'},message),
+      message!=='正在读取设置'&&h('button',{type:'button',onClick:()=>{show('正在读取设置');setReload(value=>value+1);}},'重试'));
     const set=(key,value)=>update(current=>({...current,[key]:value}));
-    const choices=(label,key,items)=>h('label',{style:{display:'block'}},label,' ',
+    const changed=JSON.stringify(draft)!==JSON.stringify(baseline);
+    const choices=(label,key,items)=>h('label',{style:settingsRow},label,
       h('select',{value:draft[key],onChange:event=>set(key,event.target.value)},
         Object.entries(items).map(([value,title])=>h('option',{key:value,value},title))));
-    const toggle=(label,checked,change)=>h('label',{style:{display:'block'}},
-      h('input',{type:'checkbox',checked,onChange:event=>change(event.target.checked)}),' ',label);
-    return h('section',null,
-      h('p',null,`已注册 ${draft.registered} 项工具 · ${draft.runtime} · 权限模式 ${draft.permissionMode}`),
-      h('fieldset',{disabled:busy},
-        h('legend',null,'电脑操作设置'),
+    const toggle=(label,checked,change)=>h('label',{style:settingsRow},label,
+      h('input',{type:'checkbox',role:'switch',checked,onChange:event=>change(event.target.checked)}));
+    const toolToggles=(tools,key)=>h('div',{style:settingsGrid},...Object.entries(tools).map(([tool,label])=>
+      h('div',{key:tool},toggle(label,draft[key].includes(tool),
+        checked=>set(key,checked?[...draft[key],tool]:draft[key].filter(value=>value!==tool))))));
+    return h('section',{style:{display:'grid',gap:16,maxWidth:800}},header,
+      h('p',{style:{margin:0,opacity:0.75}},`已注册 ${draft.registered} 项工具 · ${runtimeLabels[draft.runtime]??draft.runtime} · ${permissionLabels[draft.permissionMode]??draft.permissionMode}`),
+      h('fieldset',{disabled:busy,style:settingsGroup},
+        h('legend',null,'工具'),
         choices('工具档位','profile',{minimal:'精简',standard:'标准',full:'全部基础工具'}),
-        choices('停止快捷键','stopHotkey',{'':'关闭',esc:'Esc','ctrl+shift+f12':'Ctrl + Shift + F12'}),
-        h('label',{style:{display:'block'}},'截图缩放（0 为自动） ',
+        h('h3',{style:{fontSize:'inherit',margin:'12px 0 4px'}},'可选桌面工具'),
+        toolToggles(settingsTools,'enableTools'),
+        h('details',{style:{marginTop:12}},h('summary',null,'从当前档位停用工具'),toolToggles(baseSettingsTools,'disabledTools'))),
+      h('fieldset',{disabled:busy,style:settingsGroup},
+        h('legend',null,'截图与操作提示'),
+        h('label',{style:settingsRow},'截图缩放（0 为自动）',
           h('input',{type:'number',min:0,max:1,step:0.05,value:draft.screenshotScale,
             onChange:event=>set('screenshotScale',Number(event.target.value))})),
-        toggle('显示桌面操作提示',draft.feedbackEnabled,value=>set('feedbackEnabled',value)),
-        ...Object.entries(settingsTools).map(([key,label])=>h('div',{key},toggle(label,draft.enableTools.includes(key),
-          enabled=>set('enableTools',enabled?[...draft.enableTools,key]:draft.enableTools.filter(item=>item!==key))))),
-        h('details',null,h('summary',null,'从当前档位停用工具'),
-          ...Object.entries(baseSettingsTools).map(([key,label])=>h('div',{key},toggle(label,draft.disabledTools.includes(key),
-            disabled=>set('disabledTools',disabled?[...draft.disabledTools,key]:draft.disabledTools.filter(item=>item!==key)))))),
-        h('button',{type:'button',onClick:async()=>{
+        toggle('显示桌面操作提示',draft.feedbackEnabled,value=>set('feedbackEnabled',value))),
+      h('fieldset',{disabled:busy,style:settingsGroup},
+        h('legend',null,'紧急停止'),
+        choices('停止快捷键','stopHotkey',{'':'关闭',esc:'Esc','ctrl+shift+f12':'Ctrl + Shift + F12'})),
+      h('div',{style:{display:'flex',alignItems:'center',gap:10}},
+        h('button',{type:'button',disabled:busy||!changed,onClick:async()=>{
           setBusy(true);
           try {
             await call(draft);
-            update(await call(null));
+            const accepted=await call(null);
+            update(accepted);
+            setBaseline(accepted);
             show('已保存');
           } catch(error) {show(error.message);}
           finally {setBusy(false);}
-        }},'保存')),
-      h('p',{role:'status'},message));
-  }));
+        }},busy?'正在保存…':'保存'),
+        h('button',{type:'button',disabled:busy||!changed,onClick:()=>{update(baseline);show('');}},'取消修改'),
+        h('span',{role:'status'},message)));
+  }
+  slots.inject('settings.section',()=>slots.register({
+    name:'settings.section',id:settingsId,order:16,label:()=> '电脑操控',
+  },()=>h(ComputerUseSettings,{standalone:true})));
+  slots.inject('settings.section.icon',()=>slots.register({
+    name:'settings.section.icon',id:settingsId,
+  },({size=16})=>h('span',{'aria-hidden':true,style:{display:'inline-grid',placeItems:'start center',width:size*0.65,height:size,
+    border:'1.5px solid currentColor',borderRadius:size/2,boxSizing:'border-box'}},
+  h('span',{style:{marginTop:2,width:1.5,height:4,borderRadius:2,background:'currentColor'}}))));
+  slots.inject('plugins.bundle.config',()=>slots.register({
+    name:'plugins.bundle.config',key:'dsh-wdc-computer-use',
+  },ComputerUseSettings));
 }
 
 export function apply(ctx,config={},react) {

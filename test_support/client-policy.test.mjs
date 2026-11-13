@@ -2,11 +2,28 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import {apply} from '../dsh-wdc-computer-use/lib/client-entry.js';
 import {INTENT,toggleIntent,privacyIndex,visibleImages,canonicalPath,callDisplay} from '../dsh-wdc-computer-use/lib/client-policy.js';
 const own={meta:{wdc:{version:1,tool:'screenshot',screenshots:['D:\\shots\\shot-1.png']}},message:{callId:'shot-call',content:[]}};
 const read={meta:{path:'d:/shots/shot-1.png'},message:{callId:'read-call',content:[{type:'image',attachment:{attachmentId:'private-image'}}]}};
 const ordinary={meta:{path:'D:/other/shot-1.png'},message:{content:[{type:'image',attachment:{attachmentId:'ordinary-image'}}]}};
 const native={meta:{wdc:{version:2,tool:'screenshot',imageIds:['native-screenshot']}}};
+test('settings page, navigation icon and bundle detail use their host slots',()=>{
+  const slots=new Map();
+  const react={createElement:(type,props)=>({type,props})};
+  apply({slots:{inject:(_name,fn)=>fn(),register:(options,component)=>{
+    if(options.name.startsWith('settings.')||options.name==='plugins.bundle.config')slots.set(options.name,{options,component});
+  }}},{},react);
+  const page=slots.get('settings.section');
+  const icon=slots.get('settings.section.icon');
+  const bundle=slots.get('plugins.bundle.config');
+  assert.equal(page.options.label(),'电脑操控');
+  assert.equal(page.options.id,icon.options.id);
+  assert.equal(bundle.options.key,'dsh-wdc-computer-use');
+  assert.equal(page.component().type,bundle.component);
+  assert.equal(page.component().props.standalone,true);
+  assert.equal(icon.component({size:16}).props['aria-hidden'],true);
+});
 test('intent toggles by guarded range, preserves the task, and never submits or grants',()=>{
   let draft='点击保存',rev=3,focus=0;
   const shell={get snapshot(){return {draft,draftRev:rev};},insertText(text,span){assert.equal(span.draftRev,rev);draft=draft.slice(0,span.start)+text+draft.slice(span.end);rev++;return true;},focus(){focus++;}};
