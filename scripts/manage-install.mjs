@@ -17,7 +17,7 @@ const sourceFiles = [
   manifestName, 'README.md', 'lib/check-install.js', 'lib/client-entry.js', 'lib/client-policy.js',
   'lib/client.js', 'lib/failure-log.js', 'lib/feedback-session.js', 'lib/index.js',
   'lib/native-feedback-host.js', 'lib/permissions.js', 'lib/tool-catalog.js', 'lib/version.js',
-  'lib/visual-feedback.js', 'lib/settings.js',
+  'lib/visual-feedback.js', 'lib/settings.js', 'lib/context-budget.js',
 ];
 const digest = data => createHash('sha256').update(data).digest('hex');
 
@@ -137,7 +137,7 @@ function updateInterpreter(settings, python) {
 
 function checkPython(python) {
   const clean = spawnSync(python, ['-I','-B','-c',
-    'import sys, importlib.util; assert sys.version_info >= (3, 9); assert all(importlib.util.find_spec(x) for x in ("wdc", "mcp", "mss", "PIL", "pyautogui", "pyperclip"))',
+    'import sys, importlib.util; assert sys.version_info >= (3, 9); assert all(importlib.util.find_spec(x) for x in ("wdc", "mcp", "anyio", "mss", "PIL", "pyautogui", "pyperclip"))',
   ], {windowsHide:true, encoding:'utf8', timeout:15000, stdio:'ignore'});
   if (clean.status !== 0) fail('python_environment_unavailable');
 }

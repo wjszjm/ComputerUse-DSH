@@ -66,6 +66,7 @@ class Frame:
     context_layout: tuple | None = None
     invalid_reason: str = ""
     capture_target: tuple[int, int] | None = None
+    target_bounds: tuple[int, int, int, int] | None = None
     background: bool = False
 
     # -- 坐标换算 ------------------------------------------------------- #

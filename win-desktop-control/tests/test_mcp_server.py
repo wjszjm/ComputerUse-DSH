@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -56,7 +57,7 @@ def test_call_screen_info(server, gui):
         blocks = getattr(result, "content", result)
     assert blocks
     assert blocks[0].type == "text"
-    assert '"ok": true' in blocks[0].text
+    assert json.loads(blocks[0].text)["ok"] is True
 
 
 def test_call_unknown_tool(server):

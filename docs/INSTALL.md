@@ -12,7 +12,7 @@ npm run manage-install -- --mode install --profile "<profile-directory>" --runti
 
 The command previews changes by default. Add `--apply` after exiting DSH through its application menu. Install checks the prepared Python environment and creates a read-only configuration. If the repository's `.venv` exists, the installer can use its interpreter. Use `--source` when the profile's existing `file:` dependency points to another local package directory, and update that source first.
 
-- Use `--mode upgrade` to update an existing package and keep its installed settings. For 2.0, prepare the new Python environment with `pip install -e ".\win-desktop-control[uia,ocr]"` and pass its interpreter as `--python`. The upgrade updates the interpreter field in the plugin bundle. If you override it in the DSH profile, update that override too.
+- Use `--mode upgrade` to update an existing package and keep its installed settings. For 2.2, prepare the matching Python environment with `pip install -e ".\win-desktop-control[uia,ocr]"` and pass its interpreter as `--python`. The upgrade updates the interpreter field in the plugin bundle. If you override it in the DSH profile, update that override too.
 - Use `--mode repair` to restore missing bundle registration, the local dependency, plugin files, and the last saved plugin patch and runtime `config.json`. Keep the runtime directory and use the source version that matches the installed package. A repair cannot reconstruct settings that were never saved.
 - If the write or offline verification fails, the command restores the affected profile manifest, plugin directory, and any settings files it changed. If recovery itself fails, it leaves its staging directory for recovery.
 

@@ -1,4 +1,6 @@
-from wdc import desktop_targets, stop_hotkey
+from threading import Event
+
+from wdc import desktop_targets, stop_hotkey, windows
 from wdc.config import Config
 from wdc.tools import ComputerUse
 
@@ -46,3 +48,53 @@ def test_stop_hotkey_starts_armed_only_after_release(monkeypatch):
         pressed[0]=True
         assert stop_hotkey.should_stop()
     assert not stop_hotkey.should_stop()
+
+
+def test_wait_and_batch_bind_identity_and_stop_on_failed_confirmation(monkeypatch):
+    app = ComputerUse(Config(audit_log=False))
+    calls = []
+    monkeypatch.setattr(windows,"IS_WINDOWS",True)
+    monkeypatch.setattr("wdc.tools.platform_win.is_secure_desktop_active",lambda: False)
+    def target(handle,pid,*,foreground=True):
+        calls.append(("target",handle,pid,foreground))
+        if foreground:
+            raise windows.WindowError("Focus moved.","window_not_foreground")
+        return handle,pid,(0,0,100,100)
+    monkeypatch.setattr(desktop_targets,"target_window",target)
+    monkeypatch.setattr(windows,"window_action",lambda **step: calls.append(("action",step["action"])) or
+                        {"ok":True,"verification":{"status":"verified"}})
+    identity = {"handle":100,"expected_pid":20}
+    condition = {"kind":"window_visible",**identity}
+    cancel = Event()
+    cancel.set()
+    assert app.wait(condition=condition,cancel=cancel).code == "operation_cancelled"
+    assert not calls
+    assert app.wait(condition=condition).data["pid"] == 20
+    result = app.batch_windows([{"action":action,**identity} for action in
+                                ("wait_visible","focus","confirm_foreground","maximize")])
+    assert result.code == "window_not_foreground"
+    assert result.data["failed_step"] == 3
+    assert [item["action"] for item in result.data["completed"]] == ["wait_visible","focus"]
+    assert ("action","maximize") not in calls
+
+
+def test_checkbox_verified_only_after_exact_readback():
+    class Toggle:
+        ToggleState = 0
+        toggles = 0
+        def Toggle(self):
+            self.toggles += 1
+            self.ToggleState = 1 - self.ToggleState
+
+    pattern = Toggle()
+    class Control:
+        def GetTogglePattern(self):
+            return pattern
+
+    assert desktop_targets.invoke(Control(),{"enabled":True},"check","") == {
+        "sent":True,"verification":{"status":"verified","method":"uia_readback"},
+    }
+    assert desktop_targets.invoke(Control(),{"enabled":True},"check","")["sent"] is False
+    assert pattern.toggles == 1
+    assert desktop_targets.invoke(Control(),{"enabled":True},"uncheck","")["verification"]["status"] == "verified"
+    assert pattern.ToggleState == 0

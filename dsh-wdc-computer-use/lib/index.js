@@ -26,6 +26,7 @@ import {TOOL_CATALOG} from './tool-catalog.js';
 import {recordFailure} from './failure-log.js';
 import {pluginName, pluginVersion, versionLabel} from './version.js';
 import {mountSettings, optionalTools} from './settings.js';
+import {createLazyTools, supportsLazyTools, pruneObservations, queryKey, resultVerified} from './context-budget.js';
 
 export const name = 'wdc-computer-use';
 export const inject = [];
@@ -84,6 +85,8 @@ const DEFAULTS = {
   stopFile: path.resolve(import.meta.dirname, '../../.runtime/wdc-stop.flag'),
   stopHotkey: '',
   screenshotScale: 0,
+  lazyAdvancedTools: false,
+  compactHistory: false,
   /** Both display flags must be enabled explicitly before starting an own-process host. */
   feedbackEnabled: false,
   feedbackNativeEnabled: false,
@@ -137,124 +140,19 @@ function pruneSchema(schema, depth = 0) {
   return out;
 }
 
-/**
- * Per-tool "when to use" hints.
- *
- * Written in English on purpose: these strings ship on every single turn, and
- * the same meaning costs roughly 1.5–2x more tokens in Chinese. The model reads
- * English fine, so the only thing that changes is the bill.
- *
- * What they add is the TRIGGER (when to reach for the tool), not the function —
- * the raw docstring already says what the tool does.
- */
-const SCENE_HINTS = {
-  screen_info: 'Use to check resolution, DPI scale, or permission state; also for diagnosing coordinate mismatches.',
-  screenshot: 'Use whenever you need to SEE the screen: report what is on it, locate a target, or verify the previous action took effect. Always the first step before acting.',
-  click: 'Screenshot first, then pass image pixels with its frame_id. Invalid/stale image targeting is rejected; take a new screenshot rather than bypassing with screen mode. Input completion does not prove the target responded: verify before continuing or retrying.',
-  move_mouse: 'Use to hover (reveal tooltips or menus) or reposition the pointer without clicking.',
-  drag: 'Use to drag files, select text, or move sliders and windows.',
-  scroll: 'Use to scroll a page, list, or document. Positive = up/right, negative = down/left.',
-  type_text: 'Use to type into a field, especially CJK or long text. Pass a fresh frame_id to check window context. Verify the destination using a fresh screenshot or target readback; clipboard contents do not prove the field accepted the text.',
-  press_key: 'Use for a single key or chord, e.g. enter, esc, f5, ctrl+s, alt+tab. A completed input call is not proof of application response; verify the target before retrying.',
-  clipboard_get: 'Use to read what is currently on the clipboard.',
-  clipboard_set: 'Use to put text on the clipboard for a later paste or for another program.',
-  list_windows: 'Use to enumerate open windows, or to find the handle of a specific program window.',
-  activate_window: 'Use to bring a window to the foreground. Prefer handle plus expected_pid from list_windows; ambiguous title matches are rejected. Take a fresh screenshot after activation.',
-  window_action: 'Use to maximize, minimize, restore, close, move, or resize a window. Prefer handle plus expected_pid. The requested window state is read back; a failed verification requires observation, not blind replay.',
-  launch_app: 'Use to open a program, document, or URL, e.g. notepad, calc, a browser.',
-  run_command: 'Use for shell commands when desktop automation cannot do the job. Disabled by default; needs allow_shell.',
-  wait: 'Use while an interface is loading. Prefer this over taking repeated screenshots in a loop.',
-  stop: 'Use to halt mouse and keyboard control immediately, e.g. when the action is going the wrong way.',
-  resume: 'Use to restore control after a previous stop.',
-};
-
-/**
- * 关键参数的取值说明。
- *
- * 原始 docstring 整段透传太贵（中文），但完全不给说明又会伤精度——
- * 例如 coordinate_mode 有四个取值，不说明的话模型很容易把屏幕坐标当图片坐标传。
- * 折中：只给「选错就会点偏」的参数补一句英文说明，其余交给字段名。
- */
-const PARAM_HINTS = {
-  click: {
-    coordinate_mode: 'auto (image pixels when a frame exists) | image (strict) | screen (explicit absolute pixels) | normalized (0-1); stale/out-of-image targets are rejected',
-    frame_id: 'frame_id from the screenshot used for targeting; a new screenshot is required after input',
-    button: 'left | right | middle',
-    clicks: '1 = single, 2 = double',
-    modifiers: 'keys held during the click, e.g. "ctrl", "shift+ctrl"',
-  },
-  drag: {
-    coordinate_mode: 'auto (default, image pixels) | image | screen | normalized (0-1)',
-    frame_id: 'bind both endpoints to the same screenshot frame_id',
-  },
-  scroll: {
-    amount: 'wheel clicks; positive = up/right, negative = down/left',
-    horizontal: 'true to scroll horizontally',
-  },
-  type_text: {
-    use_clipboard: 'always (default, clipboard paste, exact) | auto | never (types key by key; IME may rewrite punctuation)',
-    press_enter: 'press Enter after typing',
-  },
-  press_key: {
-    keys: 'single key or chord, e.g. "enter", "ctrl+shift+s", "alt+tab"',
-    repeat: 'how many times to repeat (1-50)',
-    hold_ms: 'hold the keys for this many ms before releasing',
-  },
-  window_action: {
-    action: 'maximize | minimize | restore | close | focus | topmost | untopmost | move | resize',
-    title: 'window title; multiple matches at the best rank are rejected',
-    handle: 'window handle (HWND), preferred over title',
-    expected_pid: 'PID returned with the handle by list_windows',
-    timeout: 'window-state verification timeout, 0-5 seconds; default 2',
-  },
-  launch_app: {
-    path: 'executable, document, or URL',
-    args: 'command-line arguments as a single string',
-    wait: 'seconds to wait after launch',
-  },
-  screenshot: {
-    monitor: '"primary" (default) | "all" | index 0..N',
-    region: 'crop to [x, y, width, height] in screen coordinates',
-    scale: '0 = auto (fit max_image_edge), 1 = original size',
-    grid: 'overlay coordinate grid; turn on when you need to click precisely',
-  },
-};
-
-/** 把参数说明注入精简后的 schema（只在缺 description 时补，不覆盖服务端已有的） */
-function annotateSchema(toolName, schema) {
-  const hints = {frame_id:'frame_id from a fresh screenshot; binds context and expires after input',
-    expected_pid:'target PID from list_windows; use together with its handle',...PARAM_HINTS[toolName]};
-  if (!schema || typeof schema !== 'object') return schema;
-  const props = schema.properties;
-  if (!props || typeof props !== 'object') return schema;
-  for (const [key, text] of Object.entries(hints)) {
-    const prop = props[key];
-    if (prop && typeof prop === 'object' && !prop.description) {
-      prop.description = text;
-    }
-  }
-  return schema;
+// Keep the safety contract in one stable place, including when screenshot is disabled.
+function buildDescription(toolName, description, instructions) {
+  const summary = description || TOOL_CATALOG.tools.find(tool => tool.name === toolName)?.description || '';
+  const guidance = instructions || (toolName === 'screenshot' ? TOOL_CATALOG.instructions : '');
+  return guidance ? [summary, guidance].filter(Boolean).join('\n\n') : summary;
 }
 
-/** Assemble the final description: trigger + original docstring (+ loop rules for screenshot) */
-function buildDescription(toolName, rawDescription, instructions) {
-  const parts = [];
-  const hint = SCENE_HINTS[toolName];
-  if (hint) parts.push(`[When] ${hint}`);
-
-  // 原始 docstring 不再透传：Args: 段与 parameters schema 重复，功能概述又与
-  // [When] 重叠，保留只会让每轮多付一份 token。参数含义由 schema 字段名承担。
-
-  if (toolName === 'screenshot') {
-    if (instructions) parts.push(`[Safety and usage]\n${instructions}`);
-    parts.push(
-      '[Loop] screenshot → locate target in the image → click / type_text → screenshot again to confirm. '
-      + 'click x/y are interpreted as image pixels of the latest screenshot and converted server-side; never multiply by the scale yourself. '
-      + 'Pass the returned frame_id to bind the observation. Input invalidates the old frame. verification.status=not_verified means the target outcome still needs observation. '
-      + 'To save tokens, crop with region when you only need part of the screen, and use wdc_wait instead of repeated screenshots.',
-    );
+function annotateSchema(_toolName, schema) {
+  if (schema?.properties?.frame_id && !schema.properties.frame_id.description) {
+    return {...schema, properties:{...schema.properties,
+      frame_id:{...schema.properties.frame_id, description:'ID from a fresh screenshot; expires after input.'}}};
   }
-  return parts.join('\n\n');
+  return schema;
 }
 
 function pickConfig(config) {
@@ -591,6 +489,10 @@ class McpBridge {
         this.pending.delete(id);clearTimeout(timer);
         if(entry.dispatched&&entry.mutating)this.inDoubt.set(id,child);
         if(entry.dispatched&&entry.mutating)try{this.latchStop();}catch{}
+        if(entry.dispatched&&params?.name==='wait'&&child.stdin.writable) {
+          const notification={jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id}};
+          try { child.stdin.write(JSON.stringify(notification)+'\n',()=>{}); } catch {}
+        }
         entry.reject(bridgeError('operation_cancelled','操作已取消；已发出的输入须核对结果。',entry.dispatched));
       };
       this.pending.set(id, entry);
@@ -975,7 +877,31 @@ export function apply(ctx, config) {
   }
 
   reportStatus({});
-  mountSettings(ctx,options,()=>statusPayload,()=>executions>0 || bridge.activeMutations>0 || bridge.inDoubt.size>0);
+  function contextSupport() {
+    return {
+      lazyAdvancedTools:supportsLazyTools(ctx.get?.('tools')),
+      compactHistory:typeof ctx.get?.('sessions')?.registerMessageProjection === 'function' &&
+        typeof ctx.get?.('tokenMeter')?.estimateMessage === 'function' &&
+        typeof ctx.get?.('agents')?.turnBoundaryOf === 'function' &&
+        typeof ctx.get?.('compaction')?.compactIfNeeded === 'function',
+    };
+  }
+  mountSettings(ctx,options,()=>statusPayload,()=>executions>0 || bridge.activeMutations>0 || bridge.inDoubt.size>0,contextSupport);
+  if (options.compactHistory === true) {
+    const lastPruned = new WeakMap();
+    ctx.on?.('agent/pre-step', ({agent,turn,step,signal},next) => {
+      if (step===1 && agent?.session && !signal?.aborted && contextSupport().compactHistory &&
+          !bridge.activeMutations && !bridge.inDoubt.size && lastPruned.get(agent.session)!==turn) {
+        try {
+          pruneObservations(agent.session,turn,ctx.get('tokenMeter'),signal);
+          lastPruned.set(agent.session,turn);
+        } catch {
+          recordFailure('tool_result','history_compaction_failed');
+        }
+      }
+      return next();
+    });
+  }
 
   ctx.inject(['attachments'], (attachmentCtx) => {
     if (typeof attachmentCtx.attachments?.saveImage !== 'function') return;
@@ -1054,22 +980,25 @@ export function apply(ctx, config) {
 
     Promise.resolve(TOOL_CATALOG.tools)
       .then((list) => {
-        if (disposed) return;
+          if (disposed) return;
         const hidden = new Set(Array.isArray(options.hideTools) ? options.hideTools : []);
         const profileName = String(options.profile || 'standard').toLowerCase();
         const allowed = Object.prototype.hasOwnProperty.call(TOOL_PROFILES, profileName)
           ? TOOL_PROFILES[profileName]
           : TOOL_PROFILES.standard;
         const allowSet = allowed ? new Set(allowed) : null;
-        let skipped = 0;
         const failedTools = [];
-        for (const tool of list) {
-          const enabled = options.enableTools.includes(tool.name);
-          if (!CONTROL_TOOLS.has(tool.name) && (hidden.has(tool.name) ||
-              (OPT_IN_TOOLS.has(tool.name) ? !enabled : (!enabled && allowSet && !allowSet.has(tool.name))))) {
-            skipped += 1;
-            continue;
-          }
+        const selected = list.filter(({name}) => {
+          const enabled = options.enableTools.includes(name);
+          return CONTROL_TOOLS.has(name) || (!hidden.has(name) &&
+            (OPT_IN_TOOLS.has(name) ? enabled : (enabled || !allowSet || allowSet.has(name))));
+        });
+        const guidanceTool = selected.find(tool => tool.name === 'screenshot') ??
+          selected.find(tool => !CONTROL_TOOLS.has(tool.name));
+        const lazy = options.lazyAdvancedTools === true && supportsLazyTools(tools)
+          ? createLazyTools(selected,options) : undefined;
+        const skipped = list.length - selected.length;
+        for (const tool of selected) {
           const hostName = `${options.toolPrefix}${tool.name}`;
           if (manifest.some((entry) => entry.name === hostName)) continue;
           const rawSchema = tool.inputSchema && typeof tool.inputSchema === 'object'
@@ -1080,10 +1009,8 @@ export function apply(ctx, config) {
               name: hostName,
               description: buildDescription(
                 tool.name,
-                typeof tool.description === 'string' && tool.description
-                  ? tool.description
-                  : `Win Desktop Control 工具：${tool.name}`,
-                bridge.instructions,
+                tool.description,
+                tool === guidanceTool ? bridge.instructions : '',
               ),
               parameters: annotateSchema(
                 tool.name,
@@ -1092,8 +1019,11 @@ export function apply(ctx, config) {
               timeoutMs: options.approvalTimeoutMs+2*(options.initTimeoutMs+options.callTimeoutMs)+5000,
               output: {
                 schema: OUTPUT_SCHEMA,
-                presentationMeta(_args,value) {
-                  return {wdc:{version:2,tool:tool.name,imageIds:(value?.images ?? []).map(item => item.attachment.attachmentId)}};
+                presentationMeta(args,value) {
+                  const key = options.compactHistory === true ? queryKey(tool.name,args,value) : undefined;
+                  const verified = options.compactHistory === true ? resultVerified(tool.name,value) : undefined;
+                  return {wdc:{version:2,tool:tool.name,imageIds:(value?.images ?? []).map(item => item.attachment.attachmentId),
+                    ...(key===undefined ? {} : {queryKey:key}),...(verified===undefined ? {} : {verified})}};
                 },
                 render(_args, value) {
                   const text = value && typeof value === 'object' && typeof value.text === 'string'
@@ -1104,6 +1034,11 @@ export function apply(ctx, config) {
               },
               async execute(args,exec) {
                 let input = args && typeof args === 'object' ? args : {};
+                if (tool.name === 'wait' && input.condition?.kind === 'control_enabled' &&
+                    (!options.enableTools.includes('inspect_controls') || options.hideTools.includes('inspect_controls'))) {
+                  return {ok:false,text:JSON.stringify({ok:false,error_code:'tool_disabled',
+                    error:'Enable UI Automation inspection to wait for a control.'})};
+                }
                 if (IMAGE_TOOLS.has(tool.name) && input.scale === undefined && options.screenshotScale) {
                   input = {...input,scale:options.screenshotScale};
                 }
@@ -1173,13 +1108,25 @@ export function apply(ctx, config) {
                   if (!executions && !disposed) displayClosing=nativeDisplay.close();
                 }
               },
-            });
+            }, lazy?.condition(tool.name));
             if (typeof dispose === 'function') disposers.push(dispose);
             manifest.push({ name: hostName, source: tool.name });
           } catch (error) {
             recordFailure('registration', 'registration_failed', tool.name);
             failedTools.push(hostName);
             log(`注册工具 ${hostName} 失败：${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (lazy?.allowed.length) {
+          const definition = lazy.definition();
+          try {
+            const dispose = tools.register(definition);
+            if (typeof dispose === 'function') disposers.push(dispose);
+            manifest.push({name:definition.name,source:'load_tools'});
+          } catch {
+            failedTools.push(definition.name);
+            lazy.useFixedTools();
+            recordFailure('registration','registration_failed');
           }
         }
         log(`已注册 ${manifest.length} 个工具${skipped ? `（另有 ${skipped} 个按配置隐藏）` : ''}`);

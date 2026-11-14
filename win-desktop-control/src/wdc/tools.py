@@ -44,6 +44,9 @@ class ToolResult:
     def text(self) -> str:
         return json.dumps(self.payload(), ensure_ascii=False)
 
+    def compact_text(self) -> str:
+        return json.dumps(self.payload(), ensure_ascii=False, separators=(",", ":"))
+
     def image_b64(self) -> str:
         return base64.b64encode(self.image).decode("ascii") if self.image else ""
 
@@ -172,7 +175,8 @@ class ComputerUse:
             handle, pid = frame.capture_target
             x, y = frame.screen_origin
             w, h = frame.screen_size
-            if desktop_targets.target_window(handle, pid, foreground=False)[2] != (x, y, x+w, y+h):
+            bounds = frame.target_bounds or (x, y, x+w, y+h)
+            if desktop_targets.target_window(handle, pid, foreground=False)[2] != bounds:
                 raise SafetyViolation('目标窗口位置已变化，请重新截图。', 'frame_context_changed')
         if frame.context_window is not None and frame.context_window!=window_identity(windows.get_foreground_window()):
             raise SafetyViolation('前台窗口身份或位置已变化，请重新截图。','frame_context_changed')
@@ -279,7 +283,17 @@ class ComputerUse:
             foreground=None if _background else window_identity(windows.get_foreground_window())
             bounds_check={}
             if _background:
-                bounds_check["grab_window"] = lambda: window_capture.grab(*_target)
+                def grab_target():
+                    raw = window_capture.grab(*_target)
+                    left, top, right, bottom = _target[2]
+                    if raw.size != (right-left, bottom-top):
+                        raise capture.CaptureError("目标窗口截图尺寸已变化。")
+                    x, y, width, height = region
+                    if (x, y, width, height) == (left, top, right-left, bottom-top):
+                        return raw
+                    return raw.crop((x-left, y-top, x-left+width, y-top+height))
+
+                bounds_check["grab_window"] = grab_target
             elif _target is not None:
                 bounds_check["validate_pixel"] = lambda x,y: desktop_targets.window_at_point(_target[0],x,y)
             frame = capture.capture(
@@ -301,6 +315,7 @@ class ComputerUse:
                 if desktop_targets.target_window(handle,pid,foreground=not _background)[2]!=bounds:
                     raise windows.WindowError("截图期间窗口已变化。", "window_identity_changed")
                 frame.capture_target=(handle,pid)
+                frame.target_bounds=bounds
                 frame.background=_background
             if (not _background and foreground!=window_identity(windows.get_foreground_window())) or frame.context_layout!=monitor_signature(capture.list_monitors()):
                 frame.invalid_reason='capture_context_changed'
@@ -309,7 +324,7 @@ class ComputerUse:
             meta['coordinate_context_valid']=not frame.invalid_reason and frame.revision==self.session.revision
             # 只回传模型决策需要的字段：raw_size 可由 scale 推出，
             # captured_at 是服务端做时效判断用的，coordinate_space 由 hint 隐含。
-            for redundant in ("captured_at", "raw_size", "coordinate_space"):
+            for redundant in ("captured_at", "raw_size", "coordinate_space", "coordinate_hint"):
                 meta.pop(redundant, None)
             meta["format"] = mime
             meta["bytes"] = len(data)
@@ -317,6 +332,9 @@ class ComputerUse:
             if _target is not None:
                 meta["capture_backend"] = "print_window" if _background else "desktop_region"
                 meta["pointer_input"] = not _background
+                meta["target"] = {"handle":_target[0],"pid":_target[1]}
+            elif foreground:
+                meta["target"] = {"handle":foreground[0],"pid":foreground[1]}
             if self.config.save_screenshots:
                 stamp = time.strftime("%Y%m%d-%H%M%S")
                 filename = f"{stamp}-{int(frame.captured_at * 1000) % 1000:03d}.{self.config.image_format}"
@@ -343,21 +361,40 @@ class ComputerUse:
     # ------------------------------------------------------------------ #
     # 鼠标
     # ------------------------------------------------------------------ #
-    def window_screenshot(self, handle: int, expected_pid: int, scale: float = 0.0, background: bool = False) -> ToolResult:
+    def window_screenshot(self, handle: int, expected_pid: int, scale: float = 0.0,
+                          background: bool = False, crop=None) -> ToolResult:
         try:
             _, _, bounds = desktop_targets.target_window(handle, expected_pid, foreground=not background)
             left, top, right, bottom = bounds
-            result = self.screenshot(monitor="all",region=[left,top,right-left,bottom-top],scale=scale,grid=False,
+            width, height = right-left, bottom-top
+            region = [left, top, width, height]
+            if crop is not None:
+                if not isinstance(crop,(list,tuple)) or len(crop) != 4 or any(type(value) is not int for value in crop):
+                    raise ValueError("裁剪范围需要四个整数。")
+                x, y, w, h = crop
+                if min(x,y) < 0 or min(w,h) <= 0 or x+w > width or y+h > height:
+                    raise ValueError("裁剪范围必须完整位于目标窗口内。")
+                region = [left+x, top+y, w, h]
+            result = self.screenshot(monitor="all",region=region,scale=scale,grid=False,
                                      _target=(handle,expected_pid,bounds), _background=background)
             result.action="window_screenshot"
             return result
         except (SafetyViolation, windows.WindowError, ValueError) as exc:
             return ToolResult(False,"window_screenshot",error=str(exc),code=getattr(exc,"code","bad_argument"))
 
-    def inspect_controls(self, handle, expected_pid, name="", control_type="", limit=40, background=False):
-        return self._finish("inspect_controls",{},lambda:desktop_targets.uia_controls(
-            handle,expected_pid,name=name,control_type=control_type,limit=limit,background=background,
-        ))
+    def inspect_controls(self, handle, expected_pid, name="", control_type="", limit=40,
+                         background=False, detail="compact"):
+        def run():
+            if detail not in ("compact","full"):
+                raise ValueError("请选择 compact 或 full。")
+            result = desktop_targets.uia_controls(
+                handle,expected_pid,name=name,control_type=control_type,limit=limit,background=background,
+            )
+            if detail == "compact":
+                result["controls"] = [{key:value for key,value in item.items() if key != "depth"}
+                                      for item in result["controls"]]
+            return result
+        return self._finish("inspect_controls",{},run)
 
     def control_action(self, handle, expected_pid, control_id, operation, text="", background=False):
         def run():
@@ -367,14 +404,25 @@ class ComputerUse:
             return result
         return self._finish("control_action",{},run,need_input=True)
 
-    def recognize_text(self, frame_id, language="en-US"):
+    def recognize_text(self, frame_id, language="en-US", query="", detail="compact", limit=160):
         def run():
             if platform_win.is_secure_desktop_active():
                 raise SafetyViolation("安全桌面不允许识别。","secure_desktop")
             frame=self._require_frame(frame_id, observation=True)
-            words=desktop_targets.ocr_words(frame.image,language)
+            if detail not in ("compact","full") or not 1 <= limit <= 160:
+                raise ValueError("请使用有效的输出级别和结果数量。")
+            if query and (not query.strip() or len(query) > 160):
+                raise ValueError("请输入有效的待定位文字。")
+            words = desktop_targets.ocr_words(frame.image,language,limit=None if query else limit+1)
+            if query:
+                words = desktop_targets.text_matches(words, query, limit+1)
             self._require_frame(frame_id, observation=True)
-            return {"words":words,"frame_id":frame_id,"coordinate_space":"image"}
+            truncated = len(words) > limit
+            words = words[:limit]
+            if detail == "compact":
+                words = [{key:value for key,value in word.items() if key != "line"} for word in words]
+            return {"words":words,"frame_id":frame_id,"coordinate_space":"image","truncated":truncated,
+                    **({"ambiguous": len(words) > 1 or truncated} if query else {})}
         return self._finish("recognize_text",{},run)
 
     def locate_target(self, handle, expected_pid, name, frame_id=None, language="en-US", background=False):
@@ -399,11 +447,15 @@ class ComputerUse:
                 raise SafetyViolation("请先调用窗口截图并传入 frame_id。","frame_required")
             _,_,bounds=desktop_targets.target_window(handle,expected_pid,foreground=not background)
             frame=self._require_frame(frame_id, observation=True)
-            if frame.capture_target!=(handle,expected_pid) or frame.screen_origin!=bounds[:2] or frame.screen_size!=(bounds[2]-bounds[0],bounds[3]-bounds[1]):
+            frame_bounds = frame.target_bounds or (
+                *frame.screen_origin, frame.screen_origin[0]+frame.screen_size[0],
+                frame.screen_origin[1]+frame.screen_size[1],
+            )
+            if frame.capture_target!=(handle,expected_pid) or frame_bounds != bounds:
                 raise SafetyViolation("OCR 回退需要该窗口的截图。","frame_context_changed")
-            words=desktop_targets.ocr_words(frame.image,language)
+            words=desktop_targets.ocr_words(frame.image,language,limit=None)
             self._require_frame(frame_id, observation=True)
-            matches=desktop_targets.text_match(words,name)
+            matches=desktop_targets.text_match(words,name,limit=2)
             if len(matches)!=1:
                 raise SafetyViolation("文字目标不存在或不唯一。","target_ambiguous" if matches else "target_not_found")
             x,y=matches[0]
@@ -414,10 +466,10 @@ class ComputerUse:
 
     def batch_windows(self, steps):
         """Only actions with native readback may continue a batch."""
-        allowed={"focus","maximize","minimize","restore","move","resize","topmost","untopmost"}
+        allowed={"wait_visible","focus","confirm_foreground","maximize","minimize","restore","move","resize","topmost","untopmost"}
         if not 1<=len(steps)<=6:
             return ToolResult(False,"batch_windows",error="批次支持 1 至 6 步。",code="bad_argument")
-        keys={"action","handle","expected_pid","x","y","width","height"}
+        keys={"action","handle","expected_pid","x","y","width","height","timeout_ms"}
         for step in steps:
             if not isinstance(step,dict) or set(step)-keys or step.get("action") not in allowed or any(
                 type(step.get(key)) is not int or step[key]<=0 for key in ("handle","expected_pid")
@@ -425,6 +477,9 @@ class ComputerUse:
                 return ToolResult(False,"batch_windows",error="批次包含不支持或缺少目标身份的动作。",code="bad_argument")
             geometry=set(step)&{"x","y","width","height"}
             required={"move":{"x","y"},"resize":{"width","height"}}.get(step["action"],set())
+            if "timeout_ms" in step and (step["action"] != "wait_visible"
+                    or type(step["timeout_ms"]) is not int or not 0 <= step["timeout_ms"] <= 10000):
+                return ToolResult(False,"batch_windows",error="批次等待超时设置无效。",code="bad_argument")
             if (geometry!=required or any(type(step[key]) is not int for key in geometry) or
                     any(step[key]<=0 for key in geometry&{"width","height"})):
                 return ToolResult(False,"batch_windows",error="批次中的窗口坐标或尺寸无效。",code="bad_argument")
@@ -436,9 +491,21 @@ class ComputerUse:
                 progress = {"completed": completed, "failed_step": index}
                 try:
                     input_ctl.check_cancelled()
-                    if index > 1:
-                        self.guard.check_rate()
-                    result = self._window_result("window_action", windows.window_action(**step))
+                    action = step["action"]
+                    if action == "wait_visible":
+                        condition = {"kind":"window_visible","handle":step["handle"],"expected_pid":step["expected_pid"]}
+                        observation = self._wait_for(condition,step.get("timeout_ms",3000))
+                        result = observation if isinstance(observation,ToolResult) else ToolResult(
+                            True,"wait",{"verification":{"status":"verified","method":"window_readback"}},
+                        )
+                    elif action == "confirm_foreground":
+                        desktop_targets.target_window(step["handle"], step["expected_pid"])
+                        result = ToolResult(True,"confirm_foreground",
+                                            {"verification":{"status":"verified","method":"window_readback"}})
+                    else:
+                        if index > 1:
+                            self.guard.check_rate()
+                        result = self._window_result("window_action", windows.window_action(**step))
                 except EmergencyStop as exc:
                     return ToolResult(False, "batch_windows", progress, error=str(exc), code="emergency_stop")
                 except (SafetyViolation, windows.WindowError) as exc:
@@ -615,11 +682,27 @@ class ComputerUse:
     # ------------------------------------------------------------------ #
     # 窗口 / 进程
     # ------------------------------------------------------------------ #
-    def list_windows(self, include_hidden: bool = False, limit: int = 50) -> ToolResult:
+    def list_windows(self, include_hidden: bool = False, limit: int = 50,
+                     title: str = "", detail: str = "compact") -> ToolResult:
+        def run():
+            if detail not in ("compact","full") or len(title) > 260:
+                raise ValueError("窗口搜索条件无效。")
+            keys = {"handle","pid","title","process","foreground","minimized","rect"}
+            def project(window):
+                return ({key:value for key,value in window.items() if key in keys}
+                        if window and detail == "compact" else window)
+            count = max(1,int(limit))
+            found = windows.list_windows(include_hidden=include_hidden,limit=count+1,title=title)
+            foreground = windows.get_foreground_window()
+            if detail == "compact" and foreground and any(
+                item["handle"] == foreground["handle"] for item in found[:count]
+            ):
+                foreground = {"handle":foreground["handle"],"pid":foreground["pid"]}
+            return {"windows":[project(item) for item in found[:count]],"foreground":project(foreground),
+                    "truncated":len(found) > count}
         return self._finish(
             "list_windows", {"include_hidden": include_hidden, "limit": limit},
-            lambda: {"windows": windows.list_windows(include_hidden=include_hidden, limit=limit),
-                     "foreground": windows.get_foreground_window()},
+            run,
         )
 
     def _window_result(self, action, res):
@@ -696,10 +779,89 @@ class ComputerUse:
     # ------------------------------------------------------------------ #
     # 杂项
     # ------------------------------------------------------------------ #
-    def wait(self, ms: int = 500) -> ToolResult:
+    def wait(self, ms: int = 500, condition=None, timeout_ms: int = 3000, cancel=None) -> ToolResult:
+        if condition is not None:
+            return self._finish("wait", {}, lambda: self._wait_for(condition, timeout_ms, cancel))
         delay = max(0, min(int(ms), 30000)) / 1000.0
-        time.sleep(delay)
+        if cancel is not None:
+            if cancel.wait(delay):
+                return ToolResult(False,"wait",error="等待已取消。",code="operation_cancelled")
+        else:
+            time.sleep(delay)
         return ToolResult(True, "wait", {"waited_ms": int(delay * 1000)})
+
+    def _wait_for(self, condition, timeout_ms, cancel=None):
+        if type(timeout_ms) is not int or not 0 <= timeout_ms <= 10000:
+            raise ValueError("等待超时必须在 0–10000 毫秒内。")
+        if not isinstance(condition, dict) or set(condition) - {"kind","title","handle","expected_pid","name","control_type"}:
+            raise ValueError("无效的等待条件。")
+        kind = condition.get("kind")
+        title, name = condition.get("title", ""), condition.get("name", "")
+        handle, pid = condition.get("handle"), condition.get("expected_pid")
+        control_type = condition.get("control_type", "")
+        identified = type(handle) is int and handle > 0 and type(pid) is int and pid > 0
+        if (kind not in ("window_visible","control_enabled") or not isinstance(title,str)
+                or not isinstance(name,str) or not isinstance(control_type,str)
+                or len(title)>260 or len(name)>160 or len(control_type)>64):
+            raise ValueError("无效的等待条件。")
+        if kind == "window_visible":
+            if (bool(title.strip()) == identified or (not identified and (handle is not None or pid is not None))
+                    or name or control_type):
+                raise ValueError("请提供标题或一对窗口句柄和 PID。")
+        elif not identified or title or not name.strip():
+            raise ValueError("等待控件需要窗口身份与准确的控件名称。")
+        if not windows.IS_WINDOWS:
+            raise windows.WindowError("窗口操作仅支持 Windows。","window_unavailable")
+        start = time.monotonic()
+        deadline = start + timeout_ms / 1000
+        needle = title.strip().casefold()
+        while True:
+            if cancel is not None and cancel.is_set():
+                return ToolResult(False,"wait",error="等待已取消。",code="operation_cancelled")
+            input_ctl.check_cancelled()
+            if platform_win.is_secure_desktop_active():
+                raise SafetyViolation("安全桌面不允许等待窗口。","secure_desktop")
+            try:
+                if identified:
+                    hwnd, process, _ = desktop_targets.target_window(handle,pid,foreground=False)
+                else:
+                    candidates = [item for item in windows.list_windows(limit=None,title=title.strip())
+                                  if item["title"].casefold() == needle]
+                    if len(candidates) > 1:
+                        return ToolResult(False,"wait",{"candidates":[{key:item[key] for key in
+                            ("handle","pid","title")} for item in candidates[:8]],"truncated":len(candidates)>8},
+                            error="有多个同名窗口。",code="ambiguous_window")
+                    if not candidates:
+                        raise windows.WindowError("尚未找到目标窗口。","window_not_visible")
+                    candidate = candidates[0]
+                    hwnd, process, _ = desktop_targets.target_window(candidate["handle"],candidate["pid"],foreground=False)
+                outcome = {"handle":hwnd,"pid":process}
+                if kind == "control_enabled":
+                    controls = desktop_targets.uia_controls(hwnd,process,name=name,control_type=control_type,
+                                                            limit=2,background=False,
+                                                            cancelled=cancel.is_set if cancel else None,
+                                                            deadline=deadline if timeout_ms else None)
+                    if len(controls["controls"]) > 1:
+                        return ToolResult(False,"wait",{"candidates":controls["controls"]},
+                                          error="有多个同名控件。",code="target_ambiguous")
+                    if controls["truncated"] or not controls["controls"] or not controls["controls"][0]["enabled"]:
+                        raise windows.WindowError("尚未确认控件可用。","control_not_ready")
+                    outcome["control_id"] = controls["controls"][0]["id"]
+                if cancel is not None and cancel.is_set():
+                    return ToolResult(False,"wait",error="等待已取消。",code="operation_cancelled")
+                input_ctl.check_cancelled()
+                return {**outcome,"waited_ms":int((time.monotonic()-start)*1000),"condition":kind}
+            except windows.WindowError as exc:
+                if exc.code not in {"window_not_found","window_not_visible","window_not_foreground","control_not_ready"}:
+                    raise
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                return ToolResult(False,"wait",error="等待条件超时。",code="condition_timeout")
+            delay = min(remaining,0.15 if kind=="window_visible" else 0.35)
+            if cancel is not None:
+                cancel.wait(delay)
+            else:
+                time.sleep(delay)
 
     def emergency_stop(self, reason: str = "agent requested") -> ToolResult:
         data=self.guard.stop(reason)

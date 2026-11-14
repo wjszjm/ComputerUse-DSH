@@ -154,7 +154,7 @@ def _timeout(value):
     return float(value)
 
 
-def _info(hwnd: int, foreground: int | None = None) -> WindowInfo:
+def _info(hwnd: int, foreground: int | None = None, title: str | None = None) -> WindowInfo:
     pid = wt.DWORD(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
@@ -162,7 +162,7 @@ def _info(hwnd: int, foreground: int | None = None) -> WindowInfo:
     WS_MAXIMIZE = 0x01000000
     return WindowInfo(
         handle=int(hwnd),
-        title=_title(hwnd),
+        title=_title(hwnd) if title is None else title,
         class_name=_class_name(hwnd),
         pid=int(pid.value),
         process=_process_name(int(pid.value)),
@@ -183,11 +183,13 @@ def _is_tool_window(hwnd: int) -> bool:
 # --------------------------------------------------------------------------- #
 # 公开 API
 # --------------------------------------------------------------------------- #
-def list_windows(include_hidden: bool = False, limit: int = 80) -> list[dict[str, Any]]:
+def list_windows(include_hidden: bool = False, limit: int | None = 80,
+                 title: str = "") -> list[dict[str, Any]]:
     if not IS_WINDOWS:
         return []
     foreground = user32.GetForegroundWindow()
     results: list[WindowInfo] = []
+    needle = title.casefold()
 
     CALLBACK = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
@@ -195,11 +197,12 @@ def list_windows(include_hidden: bool = False, limit: int = 80) -> list[dict[str
         try:
             if not include_hidden and not user32.IsWindowVisible(hwnd):
                 return True
-            if not user32.GetWindowTextLengthW(hwnd):
+            label = _title(hwnd)
+            if not label or (needle and needle not in label.casefold()):
                 return True
             if _is_tool_window(hwnd):
                 return True
-            results.append(_info(hwnd, foreground))
+            results.append(_info(hwnd, foreground, label))
         except Exception:
             pass
         return True
@@ -207,7 +210,8 @@ def list_windows(include_hidden: bool = False, limit: int = 80) -> list[dict[str
     user32.EnumWindows(CALLBACK(_callback), 0)
     # 前台窗口排最前，其余按标题长度/进程名排序更稳定
     results.sort(key=lambda w: (not w.foreground, w.minimized, w.title.lower()))
-    return [w.to_dict() for w in results[: max(1, int(limit))]]
+    selected = results if limit is None else results[:max(1, int(limit))]
+    return [w.to_dict() for w in selected]
 
 
 def get_foreground_window() -> dict[str, Any] | None:

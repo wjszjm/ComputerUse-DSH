@@ -14,7 +14,10 @@
 from __future__ import annotations
 
 import sys
+from threading import Event
 from typing import Any, Callable, List, Optional
+
+import anyio
 
 from . import __version__
 from .config import Config, load_config
@@ -23,39 +26,14 @@ from .tools import ComputerUse, ToolResult
 from .mcp_compat import ToolContext
 from . import pointer_events
 
-INSTRUCTIONS = """你是运行在用户 Windows 桌面上的电脑操控代理，工作方式与 Computer Use 一致。
-
-【标准循环】
-1. 调用 screenshot() 看当前屏幕。返回的图片带红色坐标网格与刻度，坐标单位是「图片像素」。
-2. 在图中定位目标，调用 click(x, y)、type_text(text)、press_key(keys) 等执行动作。
-3. 再调用 screenshot() 确认结果，然后进行下一步。
-
-【坐标规则（重要）】
-- click/drag/scroll 的坐标默认按「最近一次 screenshot 的图片像素」解释，服务端会按缩放比自动换算成屏幕绝对坐标。
-- 截图可能被等比缩小（最长边受 max_image_edge 限制），所以图片坐标 ≠ 屏幕坐标，务必依赖默认的换算而不是自己乘系数。
-- 如果确实要传屏幕绝对坐标，显式设置 coordinate_mode="screen"。
-- 如果跳过截图直接操作，coordinate_mode="screen" 更安全。
-- screenshot 返回 frame_id；图像定位操作建议携带它，绑定所观察的帧。image 模式无帧/越界、旧图超过 30 秒、输入后旧图或窗口/布局变化都会拒绝，请重新截图，不要改用 screen 绕过。
-- 操作返回 verification.status=not_verified 只表示输入调用完成，不能据此宣布目标成功。使用新截图/目标状态读回复核；clipboard_get 不能证明目标输入框内容。
-- 窗口标题有多个同级候选会拒绝；先 list_windows，使用 handle 和 expected_pid 绑定身份。
-
-【操作建议】
-- 点击前先确认窗口已激活：activate_window(title=...) 比盲点任务栏更可靠。
-- 输入中文/长文本用 type_text（内部走剪贴板粘贴），不要用 press_key 逐字敲。
-- 快捷键写成 "ctrl+shift+s" 这种形式；单独按键写 "enter" / "f5" / "esc"。
-- 滚动量 amount 正数向上、负数向下，1 约等于 1 格滚轮。
-- 需要等待界面加载时用 wait(ms)，不要连续空转截图。
-
-【安全规则】
-- 删除文件、清空回收站、发送消息、支付、关闭未保存文档等不可逆操作，先向用户说明并等待确认。
-- 不要输入密码、验证码等敏感凭据；不要尝试操作锁屏或 UAC 提权界面。
-- 返回 error_code=secure_desktop / emergency_stop / read_only 时立即停止，把原因告诉用户，不要重试。
-- 同一个点击连续 2 次没反应，就重新 screenshot 分析，不要继续猜坐标。
-"""
+INSTRUCTIONS = """Operate the user's Windows desktop. Prefer an identified window and semantic controls when reliable.
+For visual targeting, pass image pixels and a fresh frame_id; the service maps coordinates. Input, changed window/layout, and frames older than 30 seconds require a new observation. Never bypass a stale frame with screen mode. Background frames are observation-only.
+Bind windows by handle and PID and resolve ambiguous matches before acting. A sent or not_verified result requires state readback or a fresh screenshot. Observe before retrying an uncertain action.
+Follow DSH approval and confirm irreversible actions with the user. Do not enter credentials or interact with lock or UAC screens. Stop on secure_desktop, emergency_stop, or read_only; do not retry."""
 
 
 def _content(mcp_types: Any, result: ToolResult) -> List[Any]:
-    blocks: List[Any] = [mcp_types.TextContent(type="text", text=result.text())]
+    blocks: List[Any] = [mcp_types.TextContent(type="text", text=result.compact_text())]
     if result.image:
         blocks.append(
             mcp_types.ImageContent(type="image", data=result.image_b64(), mimeType=result.mime)
@@ -186,9 +164,10 @@ def build_server(config: Optional[Config] = None) -> Any:
     # ------------------------------------------------------------------ #
     # 窗口
     # ------------------------------------------------------------------ #
-    def list_windows(include_hidden: bool = False, limit: int = 50) -> List[Any]:
+    def list_windows(include_hidden: bool = False, limit: int = 50,
+                     title: str = "", detail: str = "compact") -> List[Any]:
         """列出当前所有顶层窗口（标题、进程名、句柄、位置尺寸、是否前台/最小化）。"""
-        return out(app.list_windows(include_hidden=include_hidden, limit=limit))
+        return out(app.list_windows(include_hidden,limit,title,detail))
 
     def activate_window(title: Optional[str] = None, handle: Optional[int] = None,
                         expected_pid: Optional[int] = None, timeout: float = 2.0) -> List[Any]:
@@ -228,9 +207,19 @@ def build_server(config: Optional[Config] = None) -> Any:
     # ------------------------------------------------------------------ #
     # 控制
     # ------------------------------------------------------------------ #
-    def wait(ms: int = 500) -> List[Any]:
-        """等待指定毫秒（0-30000），用于等界面加载/动画结束。"""
-        return out(app.wait(ms))
+    async def wait(ms: int = 500, condition: Optional[dict] = None, timeout_ms: int = 3000) -> List[Any]:
+        if condition is None:
+            delay = max(0,min(ms,30000))
+            if delay:
+                await anyio.sleep(delay/1000)
+            return out(ToolResult(True,"wait",{"waited_ms":delay}))
+        cancel = Event()
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: out(app.wait(ms,condition,timeout_ms,cancel)), abandon_on_cancel=True,
+            )
+        finally:
+            cancel.set()
 
     def stop(reason: str = "agent requested") -> List[Any]:
         """紧急停止：立刻锁定所有输入类工具，直到调用 resume。
@@ -243,17 +232,20 @@ def build_server(config: Optional[Config] = None) -> Any:
         """解除紧急停止状态。"""
         return out(app.resume())
 
-    def window_screenshot(handle: int, expected_pid: int, scale: float = 0.0, background: bool = False):
-        return out(app.window_screenshot(handle,expected_pid,scale,background))
+    def window_screenshot(handle: int, expected_pid: int, scale: float = 0.0,
+                          background: bool = False, crop: Optional[List[int]] = None):
+        return out(app.window_screenshot(handle,expected_pid,scale,background,crop))
 
-    def inspect_controls(handle: int, expected_pid: int, name: str = "", control_type: str = "", limit: int = 40, background: bool = False):
-        return out(app.inspect_controls(handle,expected_pid,name,control_type,limit,background))
+    def inspect_controls(handle: int, expected_pid: int, name: str = "", control_type: str = "",
+                         limit: int = 40, background: bool = False, detail: str = "compact"):
+        return out(app.inspect_controls(handle,expected_pid,name,control_type,limit,background,detail))
 
     def control_action(handle: int, expected_pid: int, control_id: str, operation: str, text: str = "", background: bool = False):
         return out(app.control_action(handle,expected_pid,control_id,operation,text,background))
 
-    def recognize_text(frame_id: str, language: str = "en-US"):
-        return out(app.recognize_text(frame_id,language))
+    def recognize_text(frame_id: str, language: str = "en-US", query: str = "",
+                       detail: str = "compact", limit: int = 160):
+        return out(app.recognize_text(frame_id,language,query,detail,limit))
 
     def locate_target(handle: int, expected_pid: int, name: str, frame_id: Optional[str] = None, language: str = "en-US", background: bool = False):
         return out(app.locate_target(handle,expected_pid,name,frame_id,language,background))
@@ -294,10 +286,10 @@ def build_server(config: Optional[Config] = None) -> Any:
         (resume, "resume", resume.__doc__ or "", mutating),
     ]
 
-    for fn, name, description, annos in tools:
-        reg.add(fn, name, description.strip(), annos)
     from .schemas import tool_specs
-    descriptions={spec["name"]:spec["description"] for spec in tool_specs()}
+    descriptions = {spec["name"]: spec["description"] for spec in tool_specs()}
+    for fn, name, _description, annos in tools:
+        reg.add(fn, name, descriptions[name], annos)
     for fn, annotations in [(window_screenshot,readonly),(inspect_controls,readonly),(control_action,mutating),
                             (recognize_text,readonly),(locate_target,readonly),(batch_windows,mutating)]:
         reg.add(fn,fn.__name__,descriptions[fn.__name__],annotations)

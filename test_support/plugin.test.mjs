@@ -63,7 +63,10 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
   child.stdin = new Writable({write(chunk,encoding,done) {
     for (const line of String(chunk).trim().split('\n')) {
       const request = JSON.parse(line);
-      if (!request.id) continue;
+      if (!request.id) {
+        if (request.method === 'notifications/cancelled') child.requests.push(request);
+        continue;
+      }
       child.requests.push(request);
       if(scenario.listError && request.method==='tools/list') {
         queueMicrotask(()=>child.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:-32603,message:'mock list failure'}})+'\n'));
@@ -103,6 +106,23 @@ test('bridge handshake, tool list and call use an in-memory child', async () => 
     assert.equal(JSON.parse(result.content[0].text).action,'type_text');
   } finally { bridge.close(); }
   assert.equal(children.at(-1).killed,true);
+});
+
+test('cancelled observation wait sends MCP cancellation without latching input', async () => {
+  const b = faultBridge({hangName:'wait'});
+  const controller = new AbortController();
+  await b.start();
+  try {
+    const lease = {signal:controller.signal,check:()=>controller.signal.throwIfAborted()};
+    const pending = b.callTool('wait',{ms:30000},true,lease);
+    const call = b.child.requests.find(item=>item.params?.name==='wait');
+    assert.ok(call);
+    controller.abort();
+    await assert.rejects(pending,error=>error.code==='operation_cancelled');
+    assert.equal(b.child.requests.at(-1).params.requestId,call.id);
+    assert.equal(b.child.requests.at(-1).method,'notifications/cancelled');
+    assert.equal(b.isStopped(),false);
+  } finally { b.close(); }
 });
 
 for (const [profile,count] of [['minimal',9],['standard',14],['full',17]]) {
@@ -356,7 +376,7 @@ test('host sees legacy business errors as failures and safety controls cannot be
     assert.ok(m.tools.some(t=>t.name==='wdc_stop'));
     assert.ok(m.tools.some(t=>t.name==='wdc_resume'));
     assert.equal((await m.tools.find(t=>t.name==='wdc_click').execute({x:1,y:1})).ok,false);
-    assert.match(m.tools.find(t=>t.name==='wdc_screenshot').description,/标准循环/);
+    assert.match(m.tools.find(t=>t.name==='wdc_screenshot').description,/fresh frame_id/);
   } finally { m.close(); }
 });
 

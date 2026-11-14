@@ -42,7 +42,8 @@ def window_at_point(handle, x, y):
     return bool(child and ancestor(child,2)==handle)
 
 
-def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, select=None, background=False):
+def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, select=None,
+                 background=False, cancelled=None, deadline=None):
     if not 1 <= limit <= 80 or len(name) > 160 or len(control_type) > 64:
         raise ValueError("控件查询超过支持范围。")
     try:
@@ -52,12 +53,14 @@ def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, se
     hwnd, pid, bounds = target_window(handle, expected_pid, foreground=not background)
     results = []
     queue = deque()
-    deadline = time.monotonic() + 2
+    deadline = min(deadline if deadline is not None else float("inf"),time.monotonic()+2)
     truncated = False
     with uia.UIAutomationInitializerInThread():
         queue.append((uia.ControlFromHandle(hwnd), 0))
         visited = 0
         while queue and visited < 500 and time.monotonic() < deadline:
+            if cancelled is not None and cancelled():
+                raise SafetyViolation("等待已取消。","operation_cancelled")
             input_ctl.check_cancelled()
             control, depth = queue.popleft()
             visited += 1
@@ -104,28 +107,38 @@ def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, se
     return {"controls":results,"truncated":truncated or bool(queue)}
 
 
-def text_match(words, query):
-    """Match consecutive words on one OCR line, preserving the union of their boxes."""
+def text_matches(words, query, limit=None):
+    """Match consecutive words on one OCR line and keep the original text."""
     needle = "".join(query.casefold().split())
     matches = []
     for index, word in enumerate(words):
         text = ""
         rectangles = []
-        for part in words[index:]:
+        originals = []
+        for offset in range(index, len(words)):
+            part = words[offset]
             if part.get("line") != word.get("line"):
                 break
             text += "".join(part["text"].casefold().split())
             if not needle.startswith(text):
                 break
             rectangles.append(part["rect"])
+            originals.append(part["text"])
             if text == needle:
                 left=min(box[0] for box in rectangles)
                 top=min(box[1] for box in rectangles)
                 right=max(box[0]+box[2] for box in rectangles)
                 bottom=max(box[1]+box[3] for box in rectangles)
-                matches.append(((left+right)/2,(top+bottom)/2))
+                matches.append({"text":" ".join(originals),"rect":[left,top,right-left,bottom-top],
+                                "line":word.get("line")})
+                if limit is not None and len(matches) >= limit:
+                    return matches
                 break
     return matches
+
+
+def text_match(words, query, limit=None):
+    return [(x+w/2,y+h/2) for x,y,w,h in (item["rect"] for item in text_matches(words,query,limit))]
 
 
 def invoke(control, info, action, text):
@@ -155,12 +168,25 @@ def invoke(control, info, action, text):
         input_ctl.check_cancelled()
         pattern.Select()
         verified = pattern.IsSelected
+    elif action in {"check", "uncheck"}:
+        pattern = control.GetTogglePattern()
+        if not pattern:
+            raise SafetyViolation("控件不提供 Toggle 模式。", "pattern_unavailable")
+        desired = int(action == "check")
+        state = int(pattern.ToggleState)
+        if state not in (0, 1):
+            raise SafetyViolation("无法安全切换不确定的复选框状态。", "control_unavailable")
+        if state == desired:
+            return {"sent":False,"verification":{"status":"verified","method":"uia_readback"}}
+        input_ctl.check_cancelled()
+        pattern.Toggle()
+        verified = int(pattern.ToggleState) == desired
     else:
         raise ValueError("未知的控件操作。")
     return {"sent":True,"verification":{"status":"verified" if verified else "failed","method":"uia_readback"}}
 
 
-def ocr_words(image, language):
+def ocr_words(image, language, limit=160):
     if sys.platform != "win32":
         raise SafetyViolation("Windows OCR 仅支持 Windows。", "ocr_unavailable")
     if language not in {"en-US","zh-CN","zh-TW"}:
@@ -195,8 +221,8 @@ def ocr_words(image, language):
         for line_index, line in enumerate(result.lines):
             for word in line.words:
                 box = word.bounding_rect
-                words.append({"text":word.text[:128],"rect":[box.x,box.y,box.width,box.height],"line":line_index})
-                if len(words) == 160:
+                words.append({"text":word.text,"rect":[box.x,box.y,box.width,box.height],"line":line_index})
+                if limit is not None and len(words) == limit:
                     return words
         return words
     finally:

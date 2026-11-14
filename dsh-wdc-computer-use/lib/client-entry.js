@@ -54,8 +54,8 @@ function registerSettings(slots, react) {
     const choices=(label,key,items)=>h('label',{style:settingsRow},label,
       h('select',{value:draft[key],onChange:event=>set(key,event.target.value)},
         Object.entries(items).map(([value,title])=>h('option',{key:value,value},title))));
-    const toggle=(label,checked,change)=>h('label',{style:settingsRow},label,
-      h('input',{type:'checkbox',role:'switch',checked,onChange:event=>change(event.target.checked)}));
+    const toggle=(label,checked,change,disabled=false)=>h('label',{style:settingsRow},label,
+      h('input',{type:'checkbox',role:'switch',checked,disabled,onChange:event=>change(event.target.checked)}));
     const toolToggles=(tools,key)=>h('div',{style:settingsGrid},...Object.entries(tools).map(([tool,label])=>
       h('div',{key:tool},toggle(label,draft[key].includes(tool),
         checked=>set(key,checked?[...draft[key],tool]:draft[key].filter(value=>value!==tool))))));
@@ -76,6 +76,11 @@ function registerSettings(slots, react) {
       h('fieldset',{disabled:busy,style:settingsGroup},
         h('legend',null,'紧急停止'),
         choices('停止快捷键','stopHotkey',{'':'关闭',esc:'Esc','ctrl+shift+f12':'Ctrl + Shift + F12'})),
+      h('fieldset',{disabled:busy,style:settingsGroup},
+        h('legend',null,'上下文优化'),
+        ...Object.entries({lazyAdvancedTools:'按需加载高级工具',compactHistory:'精简已替代的历史观察'}).map(([key,label])=>
+          h('div',{key},toggle(draft.contextSupport?.[key]?label:label+'（当前 DSH 不支持）',
+            draft[key]===true,value=>set(key,value),!draft.contextSupport?.[key]&&!draft[key])))),
       h('div',{style:{display:'flex',alignItems:'center',gap:10}},
         h('button',{type:'button',disabled:busy||!changed,onClick:async()=>{
           setBusy(true);

@@ -107,6 +107,23 @@ def test_background_capture_never_samples_desktop_and_rejects_pointer_input(app,
     assert fake_backend.calls==[]
 
 
+def test_native_size_window_crop_keeps_physical_origin_and_rejects_occlusion(app,fake_backend,monkeypatch):
+    from wdc import desktop_targets
+
+    bounds = [5,7,205,107]
+    monkeypatch.setattr(desktop_targets,'target_window',lambda handle,pid,**_: (handle,pid,tuple(bounds)))
+    monkeypatch.setattr(desktop_targets,'window_at_point',lambda *_:True)
+    shot = app.window_screenshot(100,200,scale=1,crop=[50,20,38,29])
+    assert shot.ok
+    assert shot.data["image_size"] == [38,29]
+    assert app.click(12,4,frame_id=shot.data["frame_id"]).data["screen_point"] == [67,31]
+    assert app.window_screenshot(100,200,crop=[199,99,2,2]).code == "bad_argument"
+    shot = app.window_screenshot(100,200,scale=1,crop=[50,20,38,29])
+    assert shot.ok
+    monkeypatch.setattr(desktop_targets,'window_at_point',lambda *_:False)
+    assert app.click(12,4,frame_id=shot.data["frame_id"]).code == "frame_context_changed"
+
+
 def test_input_during_capture_makes_the_returned_frame_unusable_for_targeting(app,monkeypatch):
     actual=capture.capture
     def changed_capture(**kwargs):
