@@ -26,7 +26,8 @@ import {TOOL_CATALOG} from './tool-catalog.js';
 import {recordFailure} from './failure-log.js';
 import {pluginName, pluginVersion, versionLabel} from './version.js';
 import {mountSettings, optionalTools} from './settings.js';
-import {createLazyTools, supportsLazyTools, supportsCompactHistory, pruneObservations, queryKey, resultVerified} from './context-budget.js';
+import {createLazyTools, supportsLazyTools, supportsCompactHistory, pruneObservations, queryKey,
+  resultVerified, rememberObservationEvidence, observationDigest} from './context-budget.js';
 
 export const name = 'wdc-computer-use';
 export const inject = [];
@@ -36,6 +37,9 @@ const DEFAULT_HIDDEN = ['run_command'];
 const CONTROL_TOOLS = new Set(['stop', 'resume']);
 const RETRY_SAFE_TOOLS = OBSERVATION_TOOLS;
 const IMAGE_TOOLS = new Set(['screenshot','window_screenshot']);
+const POINTER_TOOLS = new Set(['click','move_mouse','drag','scroll']);
+const KEYBOARD_TOOLS = new Set(['type_text','press_key']);
+const ISOLATED_READ_TOOLS = new Set(['wait','inspect_controls','locate_target','window_screenshot','screenshot','recognize_text']);
 const OPT_IN_TOOLS = optionalTools;
 
 function bridgeError(code, message, dispatched = false) {
@@ -192,7 +196,9 @@ class McpBridge {
     this.activeCalls = 0;
     this.idleTimer = null;
     this.needsFreshFrame = false;
-    this.pendingImageDelivery = false;
+    this.observations = new WeakMap();
+    this.inputRevision = 0;
+    this.timings = new Map();
     this.exits = new Map();
     this.activeMutations = 0;
     this.stopped = false;
@@ -214,6 +220,13 @@ class McpBridge {
 
   runtimeState(state) {
     try { this.options.onRuntimeState?.({state, activeCalls:this.activeCalls, stopped:this.isStopped()}); } catch { /* Diagnostic only. */ }
+  }
+
+  measure(stage,started) {
+    const rows = this.timings.get(stage) ?? [];
+    rows.push(performance.now()-started);
+    if (rows.length > 64) rows.shift();
+    this.timings.set(stage,rows);
   }
 
   cancelIdle() { clearTimeout(this.idleTimer); this.idleTimer = null; }
@@ -360,6 +373,10 @@ class McpBridge {
           // 后面会把它附到 screenshot 工具的描述里。
           this.instructions = typeof result?.instructions === 'string' ? result.instructions : '';
           const pythonVersion = versionLabel(result?.serverInfo?.version);
+          if (this.options.requirePythonVersion && pythonVersion !== pluginVersion) {
+            this.pythonHandshake = {version:pythonVersion,catalog:'unchecked'};
+            throw bridgeError('python_version_mismatch', 'Node 插件和 Python 服务版本不一致，请使用同一候选版。');
+          }
           if (this.options.expectedTools) {
             const actual = await this.listTools();
             for (const expected of this.options.expectedTools) {
@@ -474,7 +491,9 @@ class McpBridge {
         this.pending.delete(id);
         if (entry.dispatched && entry.mutating) this.inDoubt.set(id, child);
         entry.reject(bridgeError('timeout', `MCP ${method} 超时（${timeoutMs}ms）`, entry.dispatched));
-        if (method === 'tools/call' && RETRY_SAFE_TOOLS.has(params?.name) &&
+        if (method === 'tools/call' && ISOLATED_READ_TOOLS.has(params?.name)) {
+          this.notify('notifications/cancelled',{requestId:id});
+        } else if (method === 'tools/call' && RETRY_SAFE_TOOLS.has(params?.name) &&
             this.child === child && !this.activeMutations && !this.inDoubt.size) {
           this.retire(child, bridgeError('service_exited', 'WDC 读取超时，已回收无响应的服务'));
         }
@@ -489,7 +508,7 @@ class McpBridge {
         this.pending.delete(id);clearTimeout(timer);
         if(entry.dispatched&&entry.mutating)this.inDoubt.set(id,child);
         if(entry.dispatched&&entry.mutating)try{this.latchStop();}catch{}
-        if(entry.dispatched&&params?.name==='wait'&&child.stdin.writable) {
+        if(entry.dispatched&&ISOLATED_READ_TOOLS.has(params?.name)&&child.stdin.writable) {
           const notification={jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:id}};
           try { child.stdin.write(JSON.stringify(notification)+'\n',()=>{}); } catch {}
         }
@@ -544,10 +563,68 @@ class McpBridge {
 
   latchStop() {
     this.stopped = true;
+    this.inputRevision += 1;
     this.controlVersion += 1;
     mkdirSync(path.dirname(this.stopFile()), { recursive: true });
     writeFileSync(this.stopFile(), 'stop\n', 'utf8');
     this.refreshFeedbackControl();
+  }
+
+  observation(lease) {
+    let state = this.observations.get(lease.session);
+    if (state?.scope !== lease.scope) {
+      state = {scope:lease.scope, frame:null, controls:new Map(), pending:false};
+      this.observations.set(lease.session,state);
+    }
+    return state;
+  }
+
+  observationStamp() {
+    return {child:this.child,revision:this.inputRevision,at:performance.now()};
+  }
+
+  freshObservation(stamp) {
+    return Boolean(stamp?.child) && stamp.child === this.child && stamp.revision === this.inputRevision &&
+      performance.now()-stamp.at < 30000;
+  }
+
+  scopedCall(tool, args, lease) {
+    const state = this.observation(lease);
+    const meta = {wdcScope:lease.scope};
+    const needsFrame = args.frame_id != null || KEYBOARD_TOOLS.has(tool) ||
+      (POINTER_TOOLS.has(tool) && ((args.coordinate_mode ?? 'auto') !== 'screen' ||
+        (tool === 'scroll' && args.x == null && args.y == null)));
+    if (needsFrame) {
+      if (state.pending || !this.freshObservation(state.frame) ||
+          (args.frame_id != null && args.frame_id !== state.frame.id)) {
+        throw bridgeError('stale_frame', '需要本会话最近成功交付的有效截图，请重新观察。');
+      }
+      args = {...args,frame_id:state.frame.id};
+    }
+    if (tool === 'control_action') {
+      const key = JSON.stringify([args.handle,args.expected_pid,args.control_id,Boolean(args.background)]);
+      const observed = state.controls.get(key);
+      if (!this.freshObservation(observed)) {
+        throw bridgeError('stale_control', '控件引用已失效，请先在本会话重新读取控件。');
+      }
+      meta.wdcControl = observed.identity;
+    }
+    return {arguments:args,_meta:meta};
+  }
+
+  rememberControls(tool, args, value, stamp, lease) {
+    if (!this.freshObservation(stamp) || !['inspect_controls','locate_target','wait'].includes(tool)) return;
+    const controls = this.observation(lease).controls;
+    const references = tool === 'inspect_controls' ? value.controls : [value.control];
+    const target = tool === 'wait' ? args.condition : args;
+    for (const item of Array.isArray(references) ? references : []) {
+      if (typeof item?.id !== 'string' || typeof item.name !== 'string' || typeof item.type !== 'string' ||
+          !Array.isArray(item.rect) || item.rect.length !== 4 || !item.rect.every(Number.isSafeInteger) || !target) continue;
+      const key = JSON.stringify([target.handle,target.expected_pid,item.id,Boolean(target.background)]);
+      controls.delete(key);
+      controls.set(key,{...stamp,identity:{name:item.name,type:item.type,rect:item.rect}});
+    }
+    while (controls.size > 256) controls.delete(controls.keys().next().value);
   }
 
   async callTool(toolName, args, allowRetry = true, lease = null) {
@@ -589,18 +666,31 @@ class McpBridge {
     if (mutating && this.activeMutations) throw bridgeError('action_busy', '前一个输入操作尚未结束。');
     if (mutating) this.activeMutations += 1;
     let inputRequestStarted = false;
+    let dispatchedChild;
     try {
       if (!this.ready || this.restarting) await this.ensureReady();
       lease?.check();
       // A stop arriving during cold start must win before any input is dispatched.
       if (mutating && this.isStopped()) throw bridgeError('emergency_stop', '启动期间已停止；未发送输入。');
-      const usesFrame = args?.frame_id || (['click','move_mouse','drag','scroll'].includes(toolName) &&
-        (args?.coordinate_mode ?? 'auto') !== 'screen');
-      if (usesFrame && (this.needsFreshFrame || this.pendingImageDelivery)) {
+      const usesFrame = args?.frame_id || (POINTER_TOOLS.has(toolName) && (args?.coordinate_mode ?? 'auto') !== 'screen');
+      if (!lease?.scope && usesFrame && this.needsFreshFrame) {
         throw bridgeError('stale_frame', '需要已成功交付的截图才能使用图像坐标，请重新观察。');
       }
+      const forwarded = lease?.scope ? this.scopedCall(toolName,args ?? {},lease) : {arguments:args ?? {}};
+      const stamp = this.observationStamp();
+      const observedDuringInput = this.activeMutations !== 0;
+      dispatchedChild = stamp.child;
+      if (mutating) this.inputRevision += 1;
       inputRequestStarted = true;
-      const result = await this.request('tools/call', { name: toolName, arguments: args ?? {} }, this.options.callTimeoutMs, feedbackToken, lease);
+      const requestStarted = performance.now();
+      const result = await this.request('tools/call', {
+        name:toolName, ...forwarded,
+      }, this.options.callTimeoutMs, feedbackToken, lease).finally(() => {
+        this.measure(IMAGE_TOOLS.has(toolName) ? 'capture' : mutating ? 'input' : 'readback',requestStarted);
+      });
+      if (lease?.scope && !mutating && !observedDuringInput && this.activeMutations === 0 && this.freshObservation(stamp)) {
+        Object.defineProperty(result,'observationStamp',{value:stamp});
+      }
       if (mutating && toolFailureCode(result) === 'emergency_stop') {
         try { this.latchStop(); }
         catch { this.options.onFailure?.('tool_call','stop_signal_failed',toolName); }
@@ -615,7 +705,8 @@ class McpBridge {
         throw bridgeError('outcome_unknown', '操作可能已部分或全部执行；已停止后续输入，禁止自动重试，请先核对结果。', true);
       }
       if (!mutating && allowRetry && !this.closed && ['service_exited','service_unavailable','transport_error'].includes(error.code)) {
-        await this.restart();
+        if (dispatchedChild && this.child && this.child !== dispatchedChild) await this.ensureReady();
+        else await this.restart();
         return this.callToolCore(toolName, args, false, feedbackToken,lease);
       }
       throw error;
@@ -750,7 +841,7 @@ async function convertToolResult(result, attachments, imageSize, lease, timeoutM
   }
 }
 
-function screenshotSize(result) {
+function screenshotFrame(result) {
   for (const item of result.content) {
     if (item?.type !== 'text') continue;
     let data;
@@ -758,7 +849,7 @@ function screenshotSize(result) {
     if (typeof data?.frame_id !== 'string' || !data.frame_id) continue;
     if (Array.isArray(data.image_size) && data.image_size.length === 2 &&
         data.image_size.every(value => Number.isSafeInteger(value) && value > 0) &&
-        result.content.filter(part => part?.type === 'image').length === 1) return data.image_size;
+        result.content.filter(part => part?.type === 'image').length === 1) return data;
   }
   throw bridgeError('invalid_screenshot_frame', '截图缺少可验证的图像或坐标帧，请重新观察。');
 }
@@ -826,6 +917,7 @@ export function apply(ctx, config) {
   }
   options.expectedTools = TOOL_CATALOG.tools.filter(tool =>
     !OPT_IN_TOOLS.has(tool.name) || options.enableTools.includes(tool.name));
+  options.requirePythonVersion = true;
   let bridge = createBridge();
   async function stopAll() {
     try { return await bridge.callTool('stop', {}); }
@@ -928,7 +1020,30 @@ export function apply(ctx, config) {
     });
   });
 
-  ctx.on?.('session/event', (session, event) => permissions.onSessionEvent(session, event));
+  const requestsBySession = new WeakMap();
+  const desktopTurns = new WeakMap();
+  ctx.on?.('session/event', (session,event) => {
+    if (typeof session !== 'object' || session === null) return;
+    permissions.onSessionEvent(session,event);
+    const type = event?.type;
+    const turn = event?.data?.turn;
+    const step = event?.data?.step;
+    if (type === 'tool/result' && event.data.meta?.wdc?.version === 2) {
+      desktopTurns.set(session,turn);
+    } else if (type === 'step/start' || type === 'llm/retry-started') {
+      if (!Number.isSafeInteger(turn) || !Number.isSafeInteger(step)) return;
+      requestsBySession.set(session,{turn,step,started:performance.now()});
+    } else if (type === 'assistant/message' || type === 'llm/retry' || type === 'step/end') {
+      const request = requestsBySession.get(session);
+      if (request && request.turn === turn && request.step === step) {
+        if (desktopTurns.get(session) === turn) bridge.measure('model_step',request.started);
+        requestsBySession.delete(session);
+      }
+    } else if (type === 'turn/end') {
+      desktopTurns.delete(session);
+      requestsBySession.delete(session);
+    }
+  });
   ctx.on?.('tools/pre-execute', (exec, next) => {
     if (manifest.some(entry => entry.name === exec.name && entry.source !== 'stop')) {
       permissions.preflight(exec);
@@ -1023,7 +1138,9 @@ export function apply(ctx, config) {
                 presentationMeta(args,value) {
                   const key = options.compactHistory === true ? queryKey(tool.name,args,value) : undefined;
                   const verified = options.compactHistory === true ? resultVerified(tool.name,value) : undefined;
+                  const evidence = options.compactHistory === true ? observationDigest(value) : undefined;
                   return {wdc:{version:2,tool:tool.name,imageIds:(value?.images ?? []).map(item => item.attachment.attachmentId),
+                    ...(evidence===undefined ? {} : {evidence}),
                     ...(key===undefined ? {} : {queryKey:key}),...(verified===undefined ? {} : {verified})}};
                 },
                 render(_args, value) {
@@ -1044,6 +1161,7 @@ export function apply(ctx, config) {
                   input = {...input,scale:options.screenshotScale};
                 }
                 let lease;
+                const approvalStarted = performance.now();
                 try {
                   if (disposed) throw bridgeError('bridge_closed', 'WDC 桥已关闭');
                   if (tool.name !== 'stop') lease = await currentPermissions.acquire(tool.name, exec, hostName);
@@ -1053,9 +1171,11 @@ export function apply(ctx, config) {
                   const message = /^(permission_|approval_unavailable$|operation_cancelled$)/.test(code)
                     ? error.message : '电脑操作未获授权或已取消';
                   return {ok:false,text:JSON.stringify({ok:false,error_code:code,error:message})};
+                } finally {
+                  if (tool.name !== 'stop') currentBridge.measure('approval',approvalStarted);
                 }
                 executions += 1;
-                let ownsImageDelivery = false;
+                let delivery;
                 try {
                 // Stop is local and immediate, even while Python/display is starting.
                 const attachments = toolsCtx.get?.('attachments') ?? ctx.get?.('attachments');
@@ -1065,16 +1185,30 @@ export function apply(ctx, config) {
                     error:'此 DSH 未提供原生附件服务，暂无法交付截图。'})};
                 }
                 if (IMAGE_TOOLS.has(tool.name)) {
-                  if (currentBridge.pendingImageDelivery) {
+                  const state = currentBridge.observation(lease);
+                  if (state.pending) {
                     return {ok:false,text:JSON.stringify({ok:false,error_code:'action_busy',error:'上一张截图尚未完成交付。'})};
                   }
-                  ownsImageDelivery = currentBridge.pendingImageDelivery = true;
-                  currentBridge.needsFreshFrame = true;
+                  state.pending = true;
+                  state.frame = null;
+                  delivery = state;
                 }
-                if (tool.name !== 'stop') await startDisplay();
                 let result;
                 try {
                   lease?.check();
+                  if (tool.name !== 'stop') {
+                    const overlayStarted = performance.now();
+                    const displayReady = startDisplay().finally(() => currentBridge.measure('overlay',overlayStarted));
+                    if (tool.name !== 'resume' && !currentBridge.isStopped()) {
+                      const pythonStarted = performance.now();
+                      const pythonReady = (currentBridge.ready ? Promise.resolve() : currentBridge.ensureReady())
+                        .finally(() => currentBridge.measure('python_ready',pythonStarted));
+                      await Promise.all([displayReady,pythonReady]);
+                    } else {
+                      await displayReady;
+                    }
+                    lease?.check();
+                  }
                   result = tool.name === 'stop' ? await stopAll() : await currentBridge.callTool(tool.name, input,true,lease);
                 }
                 catch (error) {
@@ -1084,15 +1218,32 @@ export function apply(ctx, config) {
                 let content;
                 const failureCode = toolFailureCode(result);
                 try {
-                  const imageSize = ownsImageDelivery && failureCode === undefined ? screenshotSize(result) : undefined;
+                  const frame = delivery && failureCode === undefined ? screenshotFrame(result) : undefined;
                   const convertible = failureCode === undefined ? result : {
                     content:Array.isArray(result?.content) ? result.content.filter(item => item?.type === 'text') : [],
                   };
-                  content = await convertToolResult(convertible, attachments, imageSize, lease, options.callTimeoutMs);
+                  const attachStarted = performance.now();
+                  content = await convertToolResult(convertible, attachments, frame?.image_size, lease, options.callTimeoutMs)
+                    .finally(() => { if (frame) currentBridge.measure('attachment',attachStarted); });
                   lease?.check();
+                  if (frame && frame.coordinate_context_valid !== false && currentBridge.freshObservation(result.observationStamp)) {
+                    delivery.frame = {...result.observationStamp,id:frame.frame_id};
+                  }
+                  if (failureCode === undefined && lease && (result.observationStamp || tool.name === 'screen_info')) {
+                    const output = content.find(item=>item.type==='text');
+                    let value;
+                    try { value = JSON.parse(output?.text); } catch {}
+                    const ownFrame = currentBridge.observation(lease).frame;
+                    if (value && tool.name === 'screen_info' &&
+                        (!currentBridge.freshObservation(ownFrame) || ownFrame.id !== value.last_frame_id)) {
+                      delete value.last_frame_id;
+                      delete value.last_frame_age_seconds;
+                      output.text = JSON.stringify(value);
+                    }
+                    if (value) currentBridge.rememberControls(tool.name,input,value,result.observationStamp,lease);
+                  }
                 }
                 catch (error) {
-                  if (IMAGE_TOOLS.has(tool.name)) currentBridge.needsFreshFrame = true;
                   recordFailure('tool_result', error.code || 'result_conversion_failed', tool.name);
                   return {ok:false,text:JSON.stringify({ok:false,action:tool.name,error_code:error.code || 'result_conversion_failed',error:error.message})};
                 }
@@ -1101,9 +1252,10 @@ export function apply(ctx, config) {
                   .map(item => item.text)
                   .join('\n');
                 if (failureCode !== undefined) recordFailure('tool_result', failureCode, tool.name);
-                return {ok:failureCode === undefined, text, images:content.filter(item => item.type === 'image')};
+                const value = {ok:failureCode === undefined, text, images:content.filter(item => item.type === 'image')};
+                return options.compactHistory === true ? rememberObservationEvidence(value,tool.name,result) : value;
                 } finally {
-                  if (ownsImageDelivery) currentBridge.pendingImageDelivery = false;
+                  if (delivery) delivery.pending = false;
                   lease?.release();
                   executions -= 1;
                   if (!executions && !disposed) displayClosing=nativeDisplay.close();

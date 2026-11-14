@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 /** Grants belong to DSH session objects and never come from tool arguments. */
 export const OBSERVATION_TOOLS = new Set([
   'screen_info','screenshot','list_windows','clipboard_get','wait',
@@ -36,12 +38,13 @@ export class SessionPermissions {
   state(session) {
     let state = this.sessions.get(session);
     if (!state) {
-      state = {mode:this.mode, version:0, stopGeneration:this.stopGeneration, grants:new Set(), pending:new Map()};
+      state = {mode:this.mode, version:0, scope:randomUUID(), stopGeneration:this.stopGeneration, grants:new Set(), pending:new Map()};
       this.sessions.set(session, state);
     }
     if (state.stopGeneration !== this.stopGeneration) {
       state.stopGeneration = this.stopGeneration;
       state.version += 1;
+      state.scope = randomUUID();
       state.grants.clear();
       state.pending.clear();
     }
@@ -78,6 +81,7 @@ export class SessionPermissions {
     const state = this.sessions.get(session);
     if (!state) return;
     state.version += 1;
+    state.scope = randomUUID();
     state.grants.clear();
     state.pending.clear();
     for (const lease of this.active) {
@@ -166,7 +170,7 @@ export class SessionPermissions {
     const controller = new AbortController();
     const cancel = () => controller.abort();
     const lease = {
-      session, controller, signal:controller.signal,
+      session, scope:state.scope, controller, signal:controller.signal,
       release:() => {
         exec.signal.removeEventListener('abort', cancel);
         this.active.delete(lease);

@@ -29,7 +29,7 @@ def test_module_importable(name):
 def test_version():
     import wdc
 
-    assert wdc.__version__.count(".") == 2
+    assert wdc.__version__.split("-",1)[0].count(".") == 2
 
 
 def test_platform_info_on_any_os():

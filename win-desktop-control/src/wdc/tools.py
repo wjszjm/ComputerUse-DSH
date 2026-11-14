@@ -10,6 +10,8 @@ import json
 import subprocess
 import threading
 import time
+from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from typing import Any, Callable
@@ -18,8 +20,10 @@ from . import capture, desktop_targets, input_ctl, platform_win, stop_hotkey, wi
 from .config import Config, load_config
 from .safety import AuditRecord, EmergencyStop, SafetyGuard, SafetyViolation
 from .targeting import MAX_FRAME_AGE_SECONDS, monitor_signature, number, on_monitor, window_identity
+from .uia_reader import UiaReader
 
 COORDINATE_MODES = ("auto", "image", "screen", "normalized")
+observation_scope: ContextVar[str | None] = ContextVar("observation_scope", default=None)
 
 
 @dataclass
@@ -57,6 +61,7 @@ class Session:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.last_frame: capture.Frame | None = None
+        self.scoped_frames: OrderedDict[str, capture.Frame] = OrderedDict()
         self.action_count = 0
         self.started_at = time.time()
         self.revision = 0
@@ -68,10 +73,20 @@ class Session:
             frame.revision = self.revision if expected_revision is None else expected_revision
             if capture_during_input or self.input_active or frame.revision != self.revision:
                 frame.invalid_reason = 'capture_during_input'
-            self.last_frame = frame
+            scope = observation_scope.get()
+            if scope is None:
+                self.last_frame = frame
+            else:
+                self.scoped_frames.pop(scope,None)
+                self.scoped_frames[scope] = frame
+                while len(self.scoped_frames) > 4 or (len(self.scoped_frames)>1 and
+                        sum(item.image.width*item.image.height*4 for item in self.scoped_frames.values()) > 128*1024*1024):
+                    self.scoped_frames.popitem(last=False)
 
     def frame_snapshot(self):
-        with self.lock:return self.last_frame, self.revision
+        with self.lock:
+            scope = observation_scope.get()
+            return (self.last_frame if scope is None else self.scoped_frames.get(scope)),self.revision
 
     def bump(self) -> int:
         with self.lock:
@@ -80,7 +95,7 @@ class Session:
 
 
 class ComputerUse:
-    def __init__(self, config: Config | None = None, guard: SafetyGuard | None = None) -> None:
+    def __init__(self, config: Config | None = None, guard: SafetyGuard | None = None, *, isolate_uia=False) -> None:
         # 必须早于任何 GUI 库导入，否则高缩放屏幕上坐标会整体偏移
         platform_win.setup_dpi_awareness()
         self.config = config or load_config()
@@ -88,6 +103,7 @@ class ComputerUse:
         self.session = Session()
         self._input_lock = threading.Lock()
         self._capture_lock = threading.Lock()
+        self._uia_reader = UiaReader() if isolate_uia else None
 
     # ------------------------------------------------------------------ #
     # 内部工具
@@ -144,6 +160,7 @@ class ComputerUse:
                 with self.session.lock:
                     self.session.input_active = False
                     self.session.revision += 1
+                    self.session.scoped_frames.clear()
             if locked:
                 self._input_lock.release()
             duration = (time.perf_counter() - start) * 1000
@@ -184,6 +201,25 @@ class ComputerUse:
             raise SafetyViolation('显示器布局已变化，请重新截图。','frame_context_changed')
         return frame
 
+    def _keyboard_target(self, frame_id):
+        if frame_id is None and observation_scope.get() is None:
+            return
+        frame = self._require_frame(frame_id)
+        self._require_focus(frame)
+        return frame
+
+    @staticmethod
+    def _require_focus(frame):
+        if observation_scope.get() is not None and (
+                frame.context_focus is None or frame.context_focus != windows.foreground_focus()):
+            raise SafetyViolation("截图后键盘焦点已变化，请重新截图。", "frame_context_changed")
+
+    def _pointer_target(self, frame_id, *points):
+        frame = self._require_frame(frame_id)
+        target = frame.capture_target or frame.context_window
+        if not target or not all(desktop_targets.window_at_point(target[0],*point) for point in points):
+            raise SafetyViolation("截图坐标已被其他窗口遮挡。","frame_context_changed")
+
     def _resolve_point(self, x: float, y: float, mode: str | None, frame_id=None, snapshot=None) -> tuple[int, int, str]:
         """Strict image targeting; only explicit screen mode bypasses frame context."""
         if mode is not None and not isinstance(mode,str):raise ValueError('coordinate_mode 必须是字符串。')
@@ -205,7 +241,10 @@ class ComputerUse:
             else:
                 if not frame.contains_image_point(x,y):raise SafetyViolation('图片坐标越界；屏幕坐标请显式使用 screen。','image_out_of_bounds')
                 px,py=self.guard.check_point(*frame.image_to_screen(x,y))
-            if frame.capture_target and not desktop_targets.window_at_point(frame.capture_target[0],px,py):
+            target = frame.capture_target or (frame.context_window if observation_scope.get() is not None else None)
+            if observation_scope.get() is not None and not target:
+                raise SafetyViolation("截图缺少可复核的前台窗口。","frame_context_changed")
+            if target and not desktop_targets.window_at_point(target[0],px,py):
                 raise SafetyViolation('截图坐标已被其他窗口遮挡。','frame_context_changed')
         elif mode=='normalized':
             if not (0<=x<=1 and 0<=y<=1):raise ValueError('normalized 坐标必须在 0~1。')
@@ -249,10 +288,11 @@ class ComputerUse:
             fg = windows.get_foreground_window()
             if fg:
                 info["active_window"] = {"title": fg.get("title"), "process": fg.get("process")}
-            if self.session.last_frame is not None:
-                info['last_frame_id']=self.session.last_frame.frame_id
+            frame,_ = self.session.frame_snapshot()
+            if frame is not None:
+                info['last_frame_id']=frame.frame_id
                 info["last_frame_age_seconds"] = round(
-                    time.time() - self.session.last_frame.captured_at, 1
+                    time.time() - frame.captured_at, 1
                 )
             return info
 
@@ -269,6 +309,7 @@ class ComputerUse:
         grid: bool | None = None,
         _target=None,
         _background=False,
+        _cancel=None,
     ) -> ToolResult:
         use_grid = self.config.default_grid if grid is None else bool(grid)
         # 用局部字典持有图片，避免并发截图时实例属性互相覆盖
@@ -281,17 +322,15 @@ class ComputerUse:
             with self.session.lock:
                 revision,active=self.session.revision,self.session.input_active
             foreground=None if _background else window_identity(windows.get_foreground_window())
+            focus = windows.foreground_focus() if foreground and observation_scope.get() is not None else None
             bounds_check={}
             if _background:
                 def grab_target():
-                    raw = window_capture.grab(*_target)
-                    left, top, right, bottom = _target[2]
-                    if raw.size != (right-left, bottom-top):
+                    raw = window_capture.grab(*_target,region,_cancel)
+                    if raw.size != tuple(region[2:]):
                         raise capture.CaptureError("目标窗口截图尺寸已变化。")
-                    x, y, width, height = region
-                    if (x, y, width, height) == (left, top, right-left, bottom-top):
-                        return raw
-                    return raw.crop((x-left, y-top, x-left+width, y-top+height))
+                    captured["backend"] = raw.info.get("capture_backend","print_window")
+                    return raw
 
                 bounds_check["grab_window"] = grab_target
             elif _target is not None:
@@ -309,6 +348,8 @@ class ComputerUse:
                 frame, fmt=self.config.image_format, quality=self.config.jpeg_quality
             )
             frame.context_window=foreground
+            if focus is not None and focus == windows.foreground_focus():
+                frame.context_focus = focus
             frame.context_layout=monitor_signature(frame.monitors)
             if _target is not None:
                 handle,pid,bounds=_target
@@ -330,7 +371,7 @@ class ComputerUse:
             meta["bytes"] = len(data)
             meta["grid"] = use_grid
             if _target is not None:
-                meta["capture_backend"] = "print_window" if _background else "desktop_region"
+                meta["capture_backend"] = captured["backend"] if _background else "desktop_region"
                 meta["pointer_input"] = not _background
                 meta["target"] = {"handle":_target[0],"pid":_target[1]}
             elif foreground:
@@ -362,7 +403,7 @@ class ComputerUse:
     # 鼠标
     # ------------------------------------------------------------------ #
     def window_screenshot(self, handle: int, expected_pid: int, scale: float = 0.0,
-                          background: bool = False, crop=None) -> ToolResult:
+                          background: bool = False, crop=None, cancel=None) -> ToolResult:
         try:
             _, _, bounds = desktop_targets.target_window(handle, expected_pid, foreground=not background)
             left, top, right, bottom = bounds
@@ -376,19 +417,26 @@ class ComputerUse:
                     raise ValueError("裁剪范围必须完整位于目标窗口内。")
                 region = [left+x, top+y, w, h]
             result = self.screenshot(monitor="all",region=region,scale=scale,grid=False,
-                                     _target=(handle,expected_pid,bounds), _background=background)
+                                     _target=(handle,expected_pid,bounds), _background=background,_cancel=cancel)
             result.action="window_screenshot"
             return result
         except (SafetyViolation, windows.WindowError, ValueError) as exc:
             return ToolResult(False,"window_screenshot",error=str(exc),code=getattr(exc,"code","bad_argument"))
 
+    def _read_controls(self, handle, pid, *, cancel=None, deadline=None, **filters):
+        cancelled = cancel.is_set if cancel is not None else None
+        if self._uia_reader is None:
+            return desktop_targets.uia_controls(handle,pid,cancelled=cancelled,deadline=deadline,**filters)
+        timeout = min(3.0,max(0.03,deadline-time.monotonic())) if deadline is not None else 3.0
+        return self._uia_reader.query(handle,pid,cancelled=cancelled,timeout=timeout,**filters)
+
     def inspect_controls(self, handle, expected_pid, name="", control_type="", limit=40,
-                         background=False, detail="compact"):
+                         background=False, detail="compact", cancel=None):
         def run():
             if detail not in ("compact","full"):
                 raise ValueError("请选择 compact 或 full。")
-            result = desktop_targets.uia_controls(
-                handle,expected_pid,name=name,control_type=control_type,limit=limit,background=background,
+            result = self._read_controls(
+                handle,expected_pid,name=name,control_type=control_type,limit=limit,background=background,cancel=cancel,
             )
             if detail == "compact":
                 result["controls"] = [{key:value for key,value in item.items() if key != "depth"}
@@ -396,9 +444,9 @@ class ComputerUse:
             return result
         return self._finish("inspect_controls",{},run)
 
-    def control_action(self, handle, expected_pid, control_id, operation, text="", background=False):
+    def control_action(self, handle, expected_pid, control_id, operation, text="", background=False, identity=None):
         def run():
-            result=desktop_targets.uia_controls(handle,expected_pid,select=(control_id,operation,text),background=background)
+            result=desktop_targets.uia_controls(handle,expected_pid,select=(control_id,operation,text,identity),background=background)
             if result["verification"]["status"] == "failed":
                 return ToolResult(False,"control_action",result,error="控件操作结果未通过读回核验。",code="verification_failed")
             return result
@@ -425,15 +473,15 @@ class ComputerUse:
                     **({"ambiguous": len(words) > 1 or truncated} if query else {})}
         return self._finish("recognize_text",{},run)
 
-    def locate_target(self, handle, expected_pid, name, frame_id=None, language="en-US", background=False):
+    def locate_target(self, handle, expected_pid, name, frame_id=None, language="en-US", background=False, cancel=None):
         def run():
             if not name.strip() or len(name)>160:
                 raise ValueError("请提供准确的控件名称或文字。")
             try:
-                controls=desktop_targets.uia_controls(handle,expected_pid,name=name,limit=2,background=background)
+                controls=self._read_controls(handle,expected_pid,name=name,limit=2,background=background,cancel=cancel)
                 matches=controls["controls"]
             except SafetyViolation as exc:
-                if exc.code!="uia_unavailable":
+                if exc.code not in {"uia_unavailable","uia_read_unavailable"}:
                     raise
                 matches=[]
                 controls={"truncated":False}
@@ -536,8 +584,10 @@ class ComputerUse:
             backend = input_ctl.get_backend()
             if parsed:
                 self.guard.check_shortcut(modifiers)
+            validation = {"validate":lambda: self._pointer_target(frame_id,(px,py))} if (
+                observation_scope.get() is not None and frame_id is not None) else {}
             with input_ctl.held_keys(backend, parsed):
-                data.update(input_ctl.click(px, py, button=button, clicks=clicks))
+                data.update(input_ctl.click(px,py,button=button,clicks=clicks,**validation))
             data.update({
                 "screen_point": [px, py],
                 "requested_point": [x, y],
@@ -583,7 +633,9 @@ class ComputerUse:
             snapshot=self.session.frame_snapshot()
             sx1, sy1, w1 = self._resolve_point(x1, y1, coordinate_mode, frame_id, snapshot)
             sx2, sy2, w2 = self._resolve_point(x2, y2, coordinate_mode, frame_id, snapshot)
-            data = input_ctl.drag(sx1, sy1, sx2, sy2, duration=float(duration), button=button)
+            validation = {"validate":lambda: self._pointer_target(frame_id,(sx1,sy1),(sx2,sy2))} if (
+                observation_scope.get() is not None and frame_id is not None) else {}
+            data = input_ctl.drag(sx1,sy1,sx2,sy2,duration=float(duration),button=button,**validation)
             data.update({"screen_from": [sx1, sy1], "screen_to": [sx2, sy2],
                          "coordinate_mode": coordinate_mode})
             warning = "; ".join(w for w in (w1, w2) if w)
@@ -613,12 +665,25 @@ class ComputerUse:
             if x is not None and y is not None:
                 px, py, warning = self._resolve_point(x, y, coordinate_mode, frame_id)
                 point = (px, py)
-            elif frame_id is not None:self._require_frame(frame_id)
+            elif frame_id is not None:
+                frame = self._require_frame(frame_id)
+                if observation_scope.get() is not None:
+                    point = input_ctl.get_backend().position()
+                    target = frame.capture_target or frame.context_window
+                    ox,oy = frame.screen_origin
+                    width,height = frame.screen_size
+                    if (target is None or not (ox <= point[0] < ox+width and oy <= point[1] < oy+height)
+                            or not desktop_targets.window_at_point(target[0],*point)):
+                        raise SafetyViolation("鼠标当前位置不在已观察的窗口内。", "frame_context_changed")
+                    self.guard.check_point(*point)
+            validation = {"validate":lambda: self._pointer_target(frame_id,point)} if (
+                observation_scope.get() is not None and frame_id is not None and point is not None) else {}
             data = input_ctl.scroll(
                 int(amount),
                 x=point[0] if point else None,
                 y=point[1] if point else None,
                 horizontal=bool(horizontal),
+                **validation,
             )
             data["direction"] = ("up" if amount > 0 else "down") if not horizontal else (
                 "right" if amount > 0 else "left"
@@ -650,12 +715,14 @@ class ComputerUse:
         audit = {"text": self.guard.redact_text(text or ""), "press_enter": bool(press_enter)}
 
         def _impl() -> dict[str, Any]:
-            if frame_id is not None:self._require_frame(frame_id)
+            frame = self._keyboard_target(frame_id)
+            validation = {"validate":lambda: self._require_focus(frame)} if observation_scope.get() else {}
             return input_ctl.type_text(
                 text,
                 interval=self.config.type_interval,
                 press_enter=bool(press_enter),
                 use_clipboard=use_clipboard,
+                **validation,
             )
 
         return self._finish("type_text", {"chars": len(text or "")}, _impl,
@@ -663,9 +730,10 @@ class ComputerUse:
 
     def press_key(self, keys: str, repeat: int = 1, hold_ms: int = 0, frame_id: str | None = None) -> ToolResult:
         def _impl() -> dict[str, Any]:
-            if frame_id is not None:self._require_frame(frame_id)
             self.guard.check_shortcut(keys)
-            return input_ctl.press_key(keys, repeat=repeat, hold_ms=hold_ms)
+            frame = self._keyboard_target(frame_id)
+            validation = {"validate":lambda: self._require_focus(frame)} if observation_scope.get() else {}
+            return input_ctl.press_key(keys,repeat=repeat,hold_ms=hold_ms,**validation)
 
         return self._finish("press_key", {"keys": keys, "repeat": repeat, "hold_ms": hold_ms},
                             _impl, need_input=True)
@@ -837,16 +905,16 @@ class ComputerUse:
                     hwnd, process, _ = desktop_targets.target_window(candidate["handle"],candidate["pid"],foreground=False)
                 outcome = {"handle":hwnd,"pid":process}
                 if kind == "control_enabled":
-                    controls = desktop_targets.uia_controls(hwnd,process,name=name,control_type=control_type,
-                                                            limit=2,background=False,
-                                                            cancelled=cancel.is_set if cancel else None,
-                                                            deadline=deadline if timeout_ms else None)
+                    controls = self._read_controls(hwnd,process,name=name,control_type=control_type,
+                                                   limit=2,background=False,cancel=cancel,
+                                                   deadline=deadline if timeout_ms else None)
                     if len(controls["controls"]) > 1:
                         return ToolResult(False,"wait",{"candidates":controls["controls"]},
                                           error="有多个同名控件。",code="target_ambiguous")
                     if controls["truncated"] or not controls["controls"] or not controls["controls"][0]["enabled"]:
                         raise windows.WindowError("尚未确认控件可用。","control_not_ready")
                     outcome["control_id"] = controls["controls"][0]["id"]
+                    outcome["control"] = {key:controls["controls"][0][key] for key in ("id","name","type","rect")}
                 if cancel is not None and cancel.is_set():
                     return ToolResult(False,"wait",error="等待已取消。",code="operation_cancelled")
                 input_ctl.check_cancelled()
@@ -865,12 +933,16 @@ class ComputerUse:
 
     def emergency_stop(self, reason: str = "agent requested") -> ToolResult:
         data=self.guard.stop(reason)
-        with self.session.lock:self.session.revision+=1
+        with self.session.lock:
+            self.session.revision += 1
+            self.session.scoped_frames.clear()
         return ToolResult(True, "emergency_stop", data)
 
     def resume(self) -> ToolResult:
         data=self.guard.resume()
-        with self.session.lock:self.session.revision+=1
+        with self.session.lock:
+            self.session.revision += 1
+            self.session.scoped_frames.clear()
         return ToolResult(True, "resume", data)
 
     # ------------------------------------------------------------------ #

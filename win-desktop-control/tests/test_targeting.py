@@ -107,6 +107,37 @@ def test_background_capture_never_samples_desktop_and_rejects_pointer_input(app,
     assert fake_backend.calls==[]
 
 
+def test_mcp_observations_are_scoped_and_focus_is_rechecked(monkeypatch, isolated_desktop):
+    import json
+    from types import SimpleNamespace
+    from wdc import desktop_targets
+    from wdc.mcp_compat import ToolContext
+    from wdc.mcp_server import build_server
+
+    focus = [(123,124,1)]
+    monkeypatch.setattr(windows,"foreground_focus",lambda: focus[0])
+    monkeypatch.setattr(desktop_targets,"window_at_point",lambda *_: True)
+    server = build_server(Config(audit_log=False,max_actions_per_second=1000))
+    async def exercise():
+        async def call(operation, args, scope):
+            ctx = ToolContext(request_context=SimpleNamespace(request_id=5,meta={"wdcScope":scope}))
+            result = await server.call_tool(operation,args,context=ctx)
+            return json.loads(result.content[0].text)
+        a,b = "a"*36,"b"*36
+        first = (await call("screenshot",{"region":[0,0,100,100]},a))["frame_id"]
+        second = (await call("screenshot",{"region":[0,0,100,100]},b))["frame_id"]
+        assert first != second
+        assert (await call("screen_info",{},a))["last_frame_id"] == first
+        assert (await call("click",{"x":20,"y":30,"frame_id":first},b))["error_code"] == "frame_mismatch"
+        first = (await call("screenshot",{"region":[0,0,100,100]},a))["frame_id"]
+        second = (await call("screenshot",{"region":[0,0,100,100]},b))["frame_id"]
+        focus[0] = (123,125,1)
+        assert (await call("press_key",{"keys":"a","frame_id":second},b))["error_code"] == "frame_context_changed"
+        assert (await call("click",{"x":20,"y":30,"frame_id":first},a))["error_code"] == "frame_required"
+    asyncio.run(exercise())
+    assert isolated_desktop["input"].calls == []
+
+
 def test_native_size_window_crop_keeps_physical_origin_and_rejects_occlusion(app,fake_backend,monkeypatch):
     from wdc import desktop_targets
 

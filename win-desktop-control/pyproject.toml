@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=80", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "win-desktop-control"
-version = "2.2.1"
+version = "2.3.0rc1"
 description = "Windows desktop-control MCP plugin for LLM agents (screenshot + mouse + keyboard + window control)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -51,7 +51,7 @@ Issues = "https://github.com/wjszjm/ComputerUse-DSH/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-wdc = ["py.typed"]
+wdc = ["py.typed", "wgc_capture.exe"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

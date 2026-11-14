@@ -32,6 +32,9 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -e ".\win-desktop-control[dev]"
           .\.venv\Scripts\python.exe -m pip check
+      - name: Build Windows Graphics Capture helper
+        shell: pwsh
+        run: pwsh -NoProfile -File .\scripts\build-window-capture.ps1
       - name: Run isolated test suite
         shell: pwsh
         run: pwsh -NoProfile -File .\run-tests.ps1
