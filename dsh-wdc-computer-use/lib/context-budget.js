@@ -7,6 +7,26 @@ const textObservations = new Set(['list_windows','inspect_controls','recognize_t
 const imageObservations = new Set(['screenshot','window_screenshot']);
 const observations = new Set([...textObservations,...imageObservations]);
 const querySalt = randomBytes(32);
+const digest = value => createHmac('sha256',querySalt).update(value).digest('hex');
+const observationEvidence = new WeakMap();
+
+export function rememberObservationEvidence(value,tool,result) {
+  if (!value.ok || !observations.has(tool)) return value;
+  if (imageObservations.has(tool)) {
+    const image = result.content.find(item=>item.type==='image');
+    if (typeof image?.data === 'string') observationEvidence.set(value,digest(image.data));
+  } else {
+    try {
+      const payload = JSON.parse(value.text);
+      if (payload.ok === true && !payload.truncated && !payload.ambiguous) {
+        observationEvidence.set(value,digest(JSON.stringify(payload)));
+      }
+    } catch { /* Keep results without a known exact payload. */ }
+  }
+  return value;
+}
+
+export const observationDigest = value => observationEvidence.get(value);
 
 export function supportsLazyTools(tools) {
   return typeof tools?.resolve === 'function' && typeof tools?.executable === 'function';
@@ -66,7 +86,7 @@ function parseObservation(event, message) {
   if (event?.type !== 'tool/result' ||
       event.data.error || message?.isError || !Array.isArray(message?.content)) return null;
   const meta = event.data.meta?.wdc;
-  if (meta?.version !== 2 || !observations.has(meta.tool)) return null;
+  if (meta?.version !== 2 || typeof meta.evidence !== 'string' || !observations.has(meta.tool)) return null;
   const text = message.content.find(block=>block.type==='text')?.text;
   if (typeof text !== 'string') return null;
   let data;
@@ -78,11 +98,12 @@ function parseObservation(event, message) {
 function observationKey({tool,data,meta}) {
   if (imageObservations.has(tool)) {
     if (!data.target || !data.coordinate_context_valid || !data.screen_region || !data.image_size) return null;
-    return JSON.stringify([tool,data.target,data.monitor,data.screen_region,data.image_size,data.pointer_input]);
+    return JSON.stringify([tool,data.target,data.monitor,data.screen_region,data.image_size,data.pointer_input,
+      data.scale,data.capture_backend,data.grid,meta.evidence]);
   }
   // UIA/OCR require a known identical selector. Older results lack provenance.
   if (meta.queryKey === undefined) return null;
-  return JSON.stringify([tool,meta.queryKey]);
+  return JSON.stringify([tool,meta.queryKey,meta.evidence]);
 }
 
 export function pruneObservations(session, turn, meter, signal) {
@@ -102,19 +123,28 @@ export function pruneObservations(session, turn, meter, signal) {
   }
   for (const event of recent) {
     if (event?.type !== 'tool/result' || !Number.isSafeInteger(event.data.turn) || event.data.turn >= turn) continue;
+    if (problemTurns.has(event.data.turn)) {
+      latest.clear();
+      continue;
+    }
     const {seq} = event;
     const message = session.deriveEventMessage(event);
     const result = parseObservation(event,message);
-    if (!result) continue;
+    if (!result) {
+      // A write, failed read, or unknown tool can make matching pixels different evidence.
+      if (!observations.has(event.data.meta?.wdc?.tool) || event.data.error || message?.isError) latest.clear();
+      continue;
+    }
     const key = observationKey(result);
     if (key === null) continue;
+    const imageBlocks = message.content.filter(block=>block.type==='image');
+    if (imageObservations.has(result.tool) && (imageBlocks.length !== 1 || imageBlocks[0].offloaded ||
+        !result.meta.imageIds?.includes(imageBlocks[0].attachment?.attachmentId))) continue;
     const count = latest.get(key) ?? 0;
     latest.set(key,count+1);
-    if (count < 2 || problemTurns.has(event.data.turn)) continue;
+    if (count < 2) continue;
     if (imageObservations.has(result.tool)) {
-      const imageBlocks = message.content.filter(block=>block.type==='image');
-      if (images.length<8 && imageBlocks.length===1 && !imageBlocks[0].offloaded &&
-          result.meta.imageIds?.includes(imageBlocks[0].attachment?.attachmentId)) {
+      if (images.length<8) {
         images.push({seq,imageIndexes:[0]});
       }
     } else if (text.length<16 && event.surfaceOp === 'append' && result.text.length>1800 && message.content.length===1) {
@@ -145,7 +175,7 @@ export function queryKey(tool,args,value) {
       ? [args.handle,args.expected_pid,args.name ?? '',args.control_type ?? '',args.background ?? false,
         args.limit ?? 40,args.detail ?? 'compact']
       : [args.frame_id,args.language ?? 'en-US',args.query ?? '',args.limit ?? 160,args.detail ?? 'compact'];
-  return createHmac('sha256',querySalt).update(JSON.stringify(fields)).digest('hex');
+  return digest(JSON.stringify(fields));
 }
 
 export function resultVerified(tool,value) {

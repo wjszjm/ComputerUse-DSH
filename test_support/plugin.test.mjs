@@ -74,7 +74,7 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
       }
       if (scenario.killName && scenario.killName === request.params?.name) { child.kill(); continue; }
       if ((scenario.hangMethod && scenario.hangMethod === request.method) || (scenario.hangName && scenario.hangName === request.params?.name) || scenario.hangNames?.includes(request.params?.name)) continue;
-      const result = request.method === 'initialize' ? {serverInfo:{name:'memory-server',version:'1.0.0'}, instructions:'Mock safety instructions'}
+      const result = request.method === 'initialize' ? {serverInfo:{name:'memory-server',version:scenario.pythonVersion ?? pluginVersion}, instructions:'Mock safety instructions'}
         : request.method === 'tools/list' ? {tools:scenario.catalogMismatch ? [] : TOOL_CATALOG.tools}
         : (typeof scenario.callResult==='function'?scenario.callResult(request):scenario.callResult) || {content:[{type:'text',text:JSON.stringify({ok:true,action:request.params.name})}]};
       queueMicrotask(()=>{if(!child.killed) child.reply(request.id,result);});
@@ -86,7 +86,8 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
   return child;
 }}});
 const {apply, McpBridge,annotateSchema,pruneSchema,buildDescription} = await import('../dsh-wdc-computer-use/lib/index.js');
-const {supportsCompactHistory} = await import('../dsh-wdc-computer-use/lib/context-budget.js');
+const {supportsCompactHistory,pruneObservations,rememberObservationEvidence,observationDigest} =
+  await import('../dsh-wdc-computer-use/lib/context-budget.js');
 const imageRef={attachmentId:'attachment-test',mediaType:'image/png',bytes:68,width:1,height:1};
 const testAttachments={saveImage:async()=>imageRef};
 const options = {
@@ -335,11 +336,12 @@ test('version check distinguishes source, installed, and reported runtime versio
     assert.equal((await m.tools.find(t=>t.name==='wdc_wait').execute({})).ok,true);
     const status=JSON.parse(fs.readFileSync(statusPath,'utf8'));
     assert.equal(status.versions.nodePlugin,pluginVersion);
-    assert.deepEqual(status.versions.pythonService,{version:'1.0.0',catalog:'matched'});
+    assert.deepEqual(status.versions.pythonService,{version:pluginVersion,catalog:'matched'});
     assert.deepEqual(checkInstallation(profileDir,statusPath).issues,[
       'source_version_mismatch','runtime_different_package',
     ]);
     status.versions.pluginDirectory=installedDir;
+    status.versions.pythonService.version='1.0.0';
     fs.writeFileSync(statusPath,JSON.stringify(status));
     const mismatch=checkInstallation(profileDir,statusPath);
     assert.deepEqual(mismatch.issues,['source_version_mismatch','runtime_version_mismatch']);
@@ -550,7 +552,7 @@ for(const listError of [false,true])test(`apply native opt-in is dormant until a
   try {
     assert.equal(children.length,before);assert.equal(displayChildren.length,displaysBefore);
     assert.equal(m.tools.length,14);
-    const pending=m.tools.find(t=>t.name==='wdc_click').execute({x:10,y:20});
+    const pending=m.tools.find(t=>t.name==='wdc_click').execute({x:10,y:20,coordinate_mode:'screen'});
     await new Promise(setImmediate);
     if(!listError){
       const child=children.at(-1);
@@ -653,15 +655,88 @@ test('frame-bound input waits until the native attachment has been delivered',as
   } finally {release(imageRef);m.close();}
 });
 
-test('a timed-out read retires its worker and a later read starts a new one',async()=>{
-  const bridge=faultBridge({hangName:'wait'},{callTimeoutMs:35});
+test('sessions own delivered frames and control references until input, revocation, or process exit',async()=>{
+  let frame = 0;
+  const m = await mounted({callResult:request=>{
+    const tool = request.params.name;
+    const data = {ok:true,action:tool};
+    if (tool==='screenshot') return {content:[
+      {type:'text',text:JSON.stringify({...data,frame_id:'frame-'+(++frame),image_size:[1,1]})},
+      {type:'image',mimeType:'image/png',data:'AA=='},
+    ]};
+    if (tool==='inspect_controls') data.controls=[{id:'control-1',name:'Save',type:'ButtonControl',rect:[1,2,3,4]}];
+    return {content:[{type:'text',text:JSON.stringify(data)}]};
+  }},{enableTools:['inspect_controls','control_action']});
+  const a = {}, b = {};
+  const run = (session,tool,args={})=>m.tools.find(t=>t.name==='wdc_'+tool).execute(args,execution('wdc_'+tool,session));
+  const point = {x:0,y:0};
+  const target = {handle:100,expected_pid:20};
+  const control = {...target,control_id:'control-1',operation:'invoke'};
   try {
-    await assert.rejects(bridge.callTool('wait',{}),{code:'timeout'});
+    assert.equal((await run(a,'screenshot')).ok,true);
+    assert.equal((await run(b,'screenshot')).ok,true);
+    assert.match((await run(b,'click',{...point,frame_id:'frame-1'})).text,/stale_frame/);
+    assert.equal((await run(a,'click',point)).ok,true);
+    const calls = children.at(-1).requests.filter(request=>request.method==='tools/call');
+    assert.equal(calls.at(-1).params.arguments.frame_id,'frame-1');
+    assert.equal(calls.at(-1).params._meta.wdcScope,calls[0].params._meta.wdcScope);
+    assert.notEqual(calls[0].params._meta.wdcScope,calls[1].params._meta.wdcScope);
+    assert.match((await run(b,'click',point)).text,/stale_frame/);
+    assert.equal((await run(a,'inspect_controls',target)).ok,true);
+    assert.match((await run(b,'control_action',control)).text,/stale_control/);
+    m.hooks.get('session/event')(a,{type:'sandbox/mode'});
+    assert.match((await run(a,'control_action',control)).text,/stale_control/);
+    assert.equal((await run(a,'inspect_controls',target)).ok,true);
+    assert.equal((await run(a,'control_action',control)).ok,true);
+    assert.deepEqual(children.at(-1).requests.at(-1).params._meta.wdcControl,
+      {name:'Save',type:'ButtonControl',rect:[1,2,3,4]});
+    assert.equal((await run(a,'screenshot')).ok,true);
+    children.at(-1).kill();
+    assert.match((await run(a,'click',point)).text,/stale_frame/);
+  } finally {m.close();}
+});
+
+test('history requires exact evidence and retains distinct, uncertain and legacy observations',()=>{
+  const attachmentId = 'fixture';
+  const click = {seq:6,type:'tool/result',data:{turn:2,meta:{wdc:{tool:'click',verified:false}}}};
+  const shot = (seq,turn,encoded,legacy=false)=> {
+    const text=JSON.stringify({ok:true,action:'screenshot',target:{handle:1,pid:2},
+      coordinate_context_valid:true,screen_region:[0,0,1,1],image_size:[1,1],frame_id:String(seq)});
+    const evidence=observationDigest(rememberObservationEvidence({ok:true,text},'screenshot',
+      {content:[{type:'image',data:encoded}]}));
+    const message={content:[{type:'text',text},{type:'image',attachment:{attachmentId}}]};
+    return {seq,type:'tool/result',data:{turn,message,meta:{wdc:{version:2,tool:'screenshot',
+      imageIds:[attachmentId],...(legacy?{}:{evidence})}}}};
+  };
+  const events = [
+    shot(1,1,'AA=='),shot(2,1,'AA=='),shot(3,1,'AA=='),shot(4,1,'AQ=='),shot(5,2,'AA=='),click,
+    shot(7,3,'AA==',true),shot(8,3,'AA=='),shot(9,3,'AA=='),shot(10,3,'AA=='),
+  ];
+  const changes=[];
+  const session = {surface:{nodes:events.map(item=>item.seq)},currentBatchPublication:null,
+    eventAt:seq=>events.find(item=>item.seq===seq),deriveEventMessage:event=>event.data.message,
+    append:items=>changes.push(...items)};
+  assert.equal(pruneObservations(session,4,{estimateMessage:()=>0}),2);
+  assert.deepEqual(changes,[['image/offload',{targets:[{seq:8,imageIndexes:[0]},{seq:1,imageIndexes:[0]}]}]]);
+});
+
+test('bridge rejects a different Python candidate before tool dispatch',async()=>{
+  const m=await mounted({pythonVersion:'2.2.1'});
+  try {
+    assert.match((await m.tools.find(t=>t.name==='wdc_wait').execute({})).text,/python_version_mismatch/);
+    assert.equal(children.at(-1).requests.some(request=>request.method==='tools/call'),false);
+  } finally {m.close();}
+});
+
+test('a timed-out unisolated read retires its worker and a later read starts a new one',async()=>{
+  const bridge=faultBridge({hangName:'screen_info'},{callTimeoutMs:35});
+  try {
+    await assert.rejects(bridge.callTool('screen_info',{}),{code:'timeout'});
     const previous=children.at(-1);
     assert.equal(previous.killed,true);
     await bridge.callTool('wait',{});
     assert.notEqual(children.at(-1),previous);
-    assert.equal(previous.requests.filter(request=>request.params?.name==='wait').length,1);
+    assert.equal(previous.requests.filter(request=>request.params?.name==='screen_info').length,1);
   } finally {bridge.close();}
 });
 
@@ -880,8 +955,8 @@ test('older hosts without presets still ask per call before startup',async()=>{
   }}});
   try{
     const tool=m.tools.find(t=>t.name==='wdc_click'),exec=execution();
-    assert.equal((await tool.execute({x:1,y:2},exec)).ok,true);
-    assert.equal((await tool.execute({x:1,y:2},exec)).ok,false);
+    assert.equal((await tool.execute({x:1,y:2,coordinate_mode:'screen'},exec)).ok,true);
+    assert.equal((await tool.execute({x:1,y:2,coordinate_mode:'screen'},exec)).ok,false);
     assert.equal(children.at(-1).requests.filter(r=>r.params?.name==='click').length,1);assert.equal(requests,2);
   }finally{m.close();}
 });
@@ -916,7 +991,7 @@ test('manual approvals remember separate observation and control grants in one s
   const call=(name,args={},target=session)=>m.tools.find(t=>t.name===name).execute(args,execution(name,target));
   try {
     for(let i=0;i<5;i++) assert.equal((await call('wdc_wait',{ms:1})).ok,true);
-    for(let i=0;i<2;i++) assert.equal((await call('wdc_click',{x:1,y:2})).ok,true);
+    for(let i=0;i<2;i++) assert.equal((await call('wdc_click',{x:1,y:2,coordinate_mode:'screen'})).ok,true);
     assert.deepEqual(requested.map(r=>r.toolName),['wdc_wait','wdc_click']);
     assert.ok(requested.every(r=>r.reason.includes('本会话')));
     assert.equal((await call('wdc_wait',{ms:1},{})).ok,true);
@@ -1060,8 +1135,12 @@ test('revocation during cold start prevents input dispatch',async()=>{
 });
 
 test('cancel dispatched input latches stop, preserves uncertainty and never replays',async()=>{
-  const m=await mounted({hangName:'type_text'}),abort=new AbortController(),exec={...execution('wdc_type_text'),signal:abort.signal};
+  const m=await mounted({hangName:'type_text',callResult:request=>request.params.name==='screenshot'?{
+    content:[{type:'text',text:'{"ok":true,"frame_id":"keyboard-frame","image_size":[1,1]}'},
+      {type:'image',mimeType:'image/png',data:'AA=='}],
+  }:undefined}),abort=new AbortController(),exec={...execution('wdc_type_text'),signal:abort.signal};
   try{
+    assert.equal((await m.tools.find(t=>t.name==='wdc_screenshot').execute({},exec)).ok,true);
     const pending=m.tools.find(t=>t.name==='wdc_type_text').execute({text:'test'},exec);await tick();
     const child=children.at(-1);abort.abort();const result=await pending;
     assert.equal(result.ok,false);assert.match(result.text,/outcome_unknown/);

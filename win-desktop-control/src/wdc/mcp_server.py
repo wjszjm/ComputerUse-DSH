@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import sys
+import re
+from collections.abc import Mapping
 from threading import Event
 from typing import Any, Callable, List, Optional
 
@@ -22,12 +24,13 @@ import anyio
 from . import __version__
 from .config import Config, load_config
 from .mcp_compat import ToolRegistrar, build_annotations, load_server_class
-from .tools import ComputerUse, ToolResult
+from .tools import ComputerUse, ToolResult, observation_scope
 from .mcp_compat import ToolContext
 from . import pointer_events
 
 INSTRUCTIONS = """Operate the user's Windows desktop. Prefer an identified window and semantic controls when reliable.
 For visual targeting, pass image pixels and a fresh frame_id; the service maps coordinates. Input, changed window/layout, and frames older than 30 seconds require a new observation. Never bypass a stale frame with screen mode. Background frames are observation-only.
+In DSH, use the current session's screenshot for typing and shortcuts. Reinspect controls after input.
 Bind windows by handle and PID and resolve ambiguous matches before acting. A sent or not_verified result requires state readback or a fresh screenshot. Observe before retrying an uncertain action.
 Follow DSH approval and confirm irreversible actions with the user. Do not enter credentials or interact with lock or UAC screens. Stop on secure_desktop, emergency_stop, or read_only; do not retry."""
 
@@ -43,7 +46,7 @@ def _content(mcp_types: Any, result: ToolResult) -> List[Any]:
 
 def build_server(config: Optional[Config] = None) -> Any:
     cfg = config or load_config()
-    app = ComputerUse(cfg)
+    app = ComputerUse(cfg,isolate_uia=True)
 
     try:
         from mcp import types as mcp_types
@@ -60,27 +63,50 @@ def build_server(config: Optional[Config] = None) -> Any:
     def out(result: ToolResult) -> Any:
         return mcp_types.CallToolResult(content=_content(mcp_types, result), isError=not result.ok)
 
-    def pointer_out(ctx, invoke):
+    def request_meta(ctx,key):
+        try:
+            meta = getattr(ctx.request_context,"meta",None) if ctx is not None else None
+            return meta.get(key) if isinstance(meta,Mapping) else getattr(meta,key,None)
+        except (ValueError,AttributeError):
+            return None
+
+    def scoped_out(ctx, invoke, *, pointer=False):
         try:
             request_id = ctx.request_id if ctx is not None else None
         except (ValueError, AttributeError):
             request_id = None  # Direct SDK calls have no transport request.
-        with pointer_events.operation(request_id):
+        scope = request_meta(ctx,"wdcScope")
+        token = observation_scope.set(scope if isinstance(scope,str) and re.fullmatch(r"[0-9a-f-]{36}",scope) else None)
+        try:
+            if pointer:
+                with pointer_events.operation(request_id):
+                    return out(invoke())
             return out(invoke())
+        finally:
+            observation_scope.reset(token)
+
+    async def read_out(ctx, invoke):
+        cancel = Event()
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: scoped_out(ctx,lambda: invoke(cancel)),abandon_on_cancel=True,
+            )
+        finally:
+            cancel.set()
 
     # ------------------------------------------------------------------ #
     # 观测
     # ------------------------------------------------------------------ #
-    def screen_info() -> List[Any]:
+    def screen_info(ctx: ToolContext = None) -> List[Any]:
         """获取屏幕与会话信息：显示器列表、分辨率、DPI 缩放、输入后端是否可用、
         当前活动窗口、安全策略状态、最近一次截图的坐标换算参数。
 
         在开始操作、或怀疑坐标偏移（高 DPI 缩放、多显示器）时先调用它。
         """
-        return out(app.screen_info())
+        return scoped_out(ctx,app.screen_info)
 
-    def screenshot(monitor: str = "primary", region: Optional[List[int]] = None,
-                   scale: float = 0.0, grid: Optional[bool] = None) -> List[Any]:
+    async def screenshot(monitor: str = "primary", region: Optional[List[int]] = None,
+                         scale: float = 0.0, grid: Optional[bool] = None, ctx: ToolContext = None) -> List[Any]:
         """截取屏幕并返回图片（附带坐标换算元数据）。
 
         Args:
@@ -89,7 +115,7 @@ def build_server(config: Optional[Config] = None) -> Any:
             scale: 缩放比，0 表示按 max_image_edge 自动缩放；1 表示原尺寸。
             grid: 是否叠加坐标网格，None 表示用配置默认值（默认开启）。
         """
-        return out(app.screenshot(monitor=monitor, region=region, scale=scale, grid=grid))
+        return await read_out(ctx,lambda cancel: app.screenshot(monitor=monitor,region=region,scale=scale,grid=grid))
 
     # ------------------------------------------------------------------ #
     # 鼠标
@@ -106,19 +132,19 @@ def build_server(config: Optional[Config] = None) -> Any:
             coordinate_mode: auto（默认）/ image / screen / normalized。
             modifiers: 点击时按住的修饰键，如 "ctrl"、"shift+ctrl"。
         """
-        return pointer_out(ctx, lambda: app.click(x, y, button=button, clicks=clicks,
-                             coordinate_mode=coordinate_mode, modifiers=modifiers, frame_id=frame_id))
+        return scoped_out(ctx, lambda: app.click(x, y, button=button, clicks=clicks,
+                            coordinate_mode=coordinate_mode, modifiers=modifiers, frame_id=frame_id),pointer=True)
 
     def move_mouse(x: float, y: float, coordinate_mode: str = "auto",
                    duration: Optional[float] = None, frame_id: Optional[str] = None, ctx: ToolContext = None) -> List[Any]:
         """把鼠标移动到指定位置（不点击），可用于触发悬停菜单。"""
-        return pointer_out(ctx, lambda: app.move(x, y, coordinate_mode=coordinate_mode, duration=duration,frame_id=frame_id))
+        return scoped_out(ctx, lambda: app.move(x, y, coordinate_mode=coordinate_mode, duration=duration,frame_id=frame_id),pointer=True)
 
     def drag(x1: float, y1: float, x2: float, y2: float, coordinate_mode: str = "auto",
              duration: float = 0.5, button: str = "left", frame_id: Optional[str] = None, ctx: ToolContext = None) -> List[Any]:
         """按住鼠标从 (x1, y1) 拖到 (x2, y2)，用于拖拽文件、框选文字、调整窗口。"""
-        return pointer_out(ctx, lambda: app.drag(x1, y1, x2, y2, coordinate_mode=coordinate_mode,
-                            duration=duration, button=button,frame_id=frame_id))
+        return scoped_out(ctx, lambda: app.drag(x1, y1, x2, y2, coordinate_mode=coordinate_mode,
+                            duration=duration, button=button,frame_id=frame_id),pointer=True)
 
     def scroll(amount: int, x: Optional[float] = None, y: Optional[float] = None,
                coordinate_mode: str = "auto", horizontal: bool = False, frame_id: Optional[str] = None, ctx: ToolContext = None) -> List[Any]:
@@ -126,14 +152,14 @@ def build_server(config: Optional[Config] = None) -> Any:
 
         不传 x/y 时在当前鼠标位置滚动。
         """
-        return pointer_out(ctx, lambda: app.scroll(amount, x=x, y=y, coordinate_mode=coordinate_mode,
-                              horizontal=horizontal,frame_id=frame_id))
+        return scoped_out(ctx, lambda: app.scroll(amount, x=x, y=y, coordinate_mode=coordinate_mode,
+                              horizontal=horizontal,frame_id=frame_id),pointer=True)
 
     # ------------------------------------------------------------------ #
     # 键盘
     # ------------------------------------------------------------------ #
     def type_text(text: str, press_enter: bool = False,
-                  use_clipboard: str = "always", frame_id: Optional[str] = None) -> List[Any]:
+                  use_clipboard: str = "always", frame_id: Optional[str] = None, ctx: ToolContext = None) -> List[Any]:
         """输入文本（支持中文/表情，默认走剪贴板粘贴）。
 
         Args:
@@ -144,14 +170,15 @@ def build_server(config: Optional[Config] = None) -> Any:
                 "7，006，652"），而工具仍返回 ok、字符数也正确，内容却已经错了。
                 剪贴板粘贴不经过输入法，逐字保真。确需逐字输入时显式传 never。
         """
-        return out(app.type_text(text, press_enter=press_enter, use_clipboard=use_clipboard,frame_id=frame_id))
+        return scoped_out(ctx,lambda: app.type_text(text,press_enter=press_enter,use_clipboard=use_clipboard,frame_id=frame_id))
 
-    def press_key(keys: str, repeat: int = 1, hold_ms: int = 0, frame_id: Optional[str] = None) -> List[Any]:
+    def press_key(keys: str, repeat: int = 1, hold_ms: int = 0, frame_id: Optional[str] = None,
+                  ctx: ToolContext = None) -> List[Any]:
         """按键或组合键，例如 "enter"、"tab"、"ctrl+c"、"alt+tab"、"win+r"，"f5"。
 
         repeat 为重复次数；hold_ms > 0 时改为按住指定毫秒再松开（用于长按方向键）。
         """
-        return out(app.press_key(keys, repeat=repeat, hold_ms=hold_ms,frame_id=frame_id))
+        return scoped_out(ctx,lambda: app.press_key(keys,repeat=repeat,hold_ms=hold_ms,frame_id=frame_id))
 
     def clipboard_get() -> List[Any]:
         """读取剪贴板文本（用于从界面批量取数据，比截图 OCR 可靠）。"""
@@ -207,19 +234,14 @@ def build_server(config: Optional[Config] = None) -> Any:
     # ------------------------------------------------------------------ #
     # 控制
     # ------------------------------------------------------------------ #
-    async def wait(ms: int = 500, condition: Optional[dict] = None, timeout_ms: int = 3000) -> List[Any]:
+    async def wait(ms: int = 500, condition: Optional[dict] = None, timeout_ms: int = 3000,
+                   ctx: ToolContext = None) -> List[Any]:
         if condition is None:
             delay = max(0,min(ms,30000))
             if delay:
                 await anyio.sleep(delay/1000)
             return out(ToolResult(True,"wait",{"waited_ms":delay}))
-        cancel = Event()
-        try:
-            return await anyio.to_thread.run_sync(
-                lambda: out(app.wait(ms,condition,timeout_ms,cancel)), abandon_on_cancel=True,
-            )
-        finally:
-            cancel.set()
+        return await read_out(ctx,lambda cancel: app.wait(ms,condition,timeout_ms,cancel))
 
     def stop(reason: str = "agent requested") -> List[Any]:
         """紧急停止：立刻锁定所有输入类工具，直到调用 resume。
@@ -232,23 +254,30 @@ def build_server(config: Optional[Config] = None) -> Any:
         """解除紧急停止状态。"""
         return out(app.resume())
 
-    def window_screenshot(handle: int, expected_pid: int, scale: float = 0.0,
-                          background: bool = False, crop: Optional[List[int]] = None):
-        return out(app.window_screenshot(handle,expected_pid,scale,background,crop))
+    async def window_screenshot(handle: int, expected_pid: int, scale: float = 0.0,
+                                background: bool = False, crop: Optional[List[int]] = None, ctx: ToolContext = None):
+        return await read_out(ctx,lambda cancel: app.window_screenshot(handle,expected_pid,scale,background,crop,cancel))
 
-    def inspect_controls(handle: int, expected_pid: int, name: str = "", control_type: str = "",
-                         limit: int = 40, background: bool = False, detail: str = "compact"):
-        return out(app.inspect_controls(handle,expected_pid,name,control_type,limit,background,detail))
+    async def inspect_controls(handle: int, expected_pid: int, name: str = "", control_type: str = "",
+                               limit: int = 40, background: bool = False, detail: str = "compact", ctx: ToolContext = None):
+        return await read_out(ctx,lambda cancel: app.inspect_controls(handle,expected_pid,name,control_type,limit,background,detail,cancel))
 
-    def control_action(handle: int, expected_pid: int, control_id: str, operation: str, text: str = "", background: bool = False):
-        return out(app.control_action(handle,expected_pid,control_id,operation,text,background))
+    async def control_action(handle: int, expected_pid: int, control_id: str, operation: str,
+                             text: str = "", background: bool = False, ctx: ToolContext = None):
+        identity = request_meta(ctx,"wdcControl")
+        if request_meta(ctx,"wdcScope") and not isinstance(identity,dict):
+            return out(ToolResult(False,"control_action",error="控件引用缺少最近观察。",code="stale_control"))
+        return await anyio.to_thread.run_sync(
+            lambda: out(app.control_action(handle,expected_pid,control_id,operation,text,background,identity)),
+        )
 
-    def recognize_text(frame_id: str, language: str = "en-US", query: str = "",
-                       detail: str = "compact", limit: int = 160):
-        return out(app.recognize_text(frame_id,language,query,detail,limit))
+    async def recognize_text(frame_id: str, language: str = "en-US", query: str = "",
+                             detail: str = "compact", limit: int = 160, ctx: ToolContext = None):
+        return await read_out(ctx,lambda cancel: app.recognize_text(frame_id,language,query,detail,limit))
 
-    def locate_target(handle: int, expected_pid: int, name: str, frame_id: Optional[str] = None, language: str = "en-US", background: bool = False):
-        return out(app.locate_target(handle,expected_pid,name,frame_id,language,background))
+    async def locate_target(handle: int, expected_pid: int, name: str, frame_id: Optional[str] = None,
+                            language: str = "en-US", background: bool = False, ctx: ToolContext = None):
+        return await read_out(ctx,lambda cancel: app.locate_target(handle,expected_pid,name,frame_id,language,background,cancel))
 
     def batch_windows(steps: List[dict]):
         return out(app.batch_windows(steps))

@@ -29,6 +29,7 @@ screenshots/
 *.zip
 *.tgz
 *.whl
+/win-desktop-control/src/wdc/wgc_capture.exe
 
 # Local configuration and secrets
 .env

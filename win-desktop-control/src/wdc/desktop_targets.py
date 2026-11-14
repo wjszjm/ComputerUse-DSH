@@ -42,8 +42,61 @@ def window_at_point(handle, x, y):
     return bool(child and ancestor(child,2)==handle)
 
 
+def _cached_uia(uia, hwnd, pid, name, control_type, limit, deadline, cancelled):
+    from uiautomation.uiautomation import ControlTypeNames, _AutomationClient
+
+    automation = _AutomationClient.instance().IUIAutomation
+    request = automation.CreateCacheRequest()
+    request.TreeFilter = automation.RawViewCondition
+    props = uia.PropertyId
+    for prop in (props.ProcessIdProperty,props.NameProperty,props.ControlTypeProperty,
+                 props.BoundingRectangleProperty,props.IsOffscreenProperty,props.IsPasswordProperty,
+                 props.IsEnabledProperty,props.RuntimeIdProperty):
+        request.AddProperty(prop)
+    # Keep a live element reference only to enumerate its immediate children.
+    queue = deque([(automation.ElementFromHandleBuildCache(hwnd,request),0)])
+    results = []
+    truncated = False
+    visited = 0
+    condition = automation.CreateTrueCondition()
+    folded_name,folded_type = name.casefold(),control_type.casefold()
+    while queue and visited < 500 and time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            raise SafetyViolation("等待已取消。","operation_cancelled")
+        element,depth = queue.popleft()
+        visited += 1
+        if not element or element.CachedProcessId != pid:
+            continue
+        if depth < 12:
+            children = element.FindAllBuildCache(2,condition,request)  # TreeScope_Children
+            length = children.Length if children else 0
+            truncated |= length > 100
+            queue.extend((children.GetElement(index),depth+1) for index in range(min(100,length)))
+        else:
+            truncated = True
+        if element.CachedIsOffscreen or element.CachedIsPassword:
+            continue
+        label = element.CachedName or ""
+        kind = ControlTypeNames.get(element.CachedControlType,"")
+        if (folded_name and folded_name != label.casefold()) or (folded_type and folded_type != kind.casefold()):
+            continue
+        rect = element.CachedBoundingRectangle
+        runtime_id = element.GetCachedPropertyValue(props.RuntimeIdProperty)
+        if runtime_id is None or not kind or rect.left >= rect.right or rect.top >= rect.bottom:
+            continue
+        identifier = ".".join(map(str,runtime_id))
+        if not identifier:
+            continue
+        results.append({"id":identifier,"name":label[:160],"type":kind,
+                        "rect":[rect.left,rect.top,rect.right,rect.bottom],"enabled":bool(element.CachedIsEnabled),
+                        "depth":depth})
+        if len(results) == limit:
+            break
+    return {"controls":results,"truncated":truncated or bool(queue)}
+
+
 def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, select=None,
-                 background=False, cancelled=None, deadline=None):
+                 background=False, cancelled=None, deadline=None, cached=False):
     if not 1 <= limit <= 80 or len(name) > 160 or len(control_type) > 64:
         raise ValueError("控件查询超过支持范围。")
     try:
@@ -56,6 +109,16 @@ def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, se
     deadline = min(deadline if deadline is not None else float("inf"),time.monotonic()+2)
     truncated = False
     with uia.UIAutomationInitializerInThread():
+        if cached and select is None:
+            from _ctypes import COMError
+            try:
+                result = _cached_uia(uia,hwnd,pid,name,control_type,limit,deadline,cancelled)
+            except (AttributeError,COMError,ImportError,TypeError):
+                result = None
+            if result is not None:
+                if target_window(handle,expected_pid,foreground=not background)[2] != bounds:
+                    raise windows.WindowError("读取控件期间窗口已变化。","window_identity_changed")
+                return result
         queue.append((uia.ControlFromHandle(hwnd), 0))
         visited = 0
         while queue and visited < 500 and time.monotonic() < deadline:
@@ -91,8 +154,11 @@ def uia_controls(handle, expected_pid, *, name="", control_type="", limit=40, se
                 if info["id"] == select[0]:
                     if target_window(handle, expected_pid, foreground=not background)[2] != bounds:
                         raise windows.WindowError("控件所在窗口已变化。", "window_identity_changed")
+                    identity = select[3] if len(select) > 3 else None
+                    if identity is not None and any(info[key] != identity.get(key) for key in ("name","type","rect")):
+                        raise SafetyViolation("控件属性已发生变化，请重新读取。","stale_control")
                     focused_window = windows.user32.GetForegroundWindow() if background else None
-                    outcome = invoke(control, info, *select[1:])
+                    outcome = invoke(control,info,select[1],select[2])
                     if background:
                         outcome["foreground_changed"] = windows.user32.GetForegroundWindow() != focused_window
                     return outcome

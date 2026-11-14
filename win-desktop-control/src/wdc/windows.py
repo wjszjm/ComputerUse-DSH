@@ -55,6 +55,28 @@ class WindowError(ValueError):
         super().__init__(message);self.code=code
 
 
+class _GuiThreadInfo(ctypes.Structure):
+    _fields_ = [("size",wt.DWORD),("flags",wt.DWORD),("active",wt.HWND),("focus",wt.HWND),
+                ("capture",wt.HWND),("menu_owner",wt.HWND),("move_size",wt.HWND),
+                ("caret",wt.HWND),("caret_rect",wt.RECT)]
+
+
+def foreground_focus():
+    if not IS_WINDOWS:
+        return None
+    info = _GuiThreadInfo()
+    info.size = ctypes.sizeof(info)
+    get_info = user32.GetGUIThreadInfo
+    get_info.argtypes = [wt.DWORD,ctypes.POINTER(_GuiThreadInfo)]
+    get_info.restype = wt.BOOL
+    if not get_info(0,ctypes.byref(info)) or not info.focus or info.active != user32.GetForegroundWindow():
+        return None
+    pid = wt.DWORD()
+    if not user32.GetWindowThreadProcessId(info.focus,ctypes.byref(pid)) or not pid.value:
+        return None
+    return info.active,info.focus,pid.value
+
+
 @dataclass
 class WindowInfo:
     handle: int

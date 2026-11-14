@@ -1,8 +1,67 @@
 from threading import Event
+from types import SimpleNamespace
+import sys
+
+import pytest
 
 from wdc import desktop_targets, stop_hotkey, windows
 from wdc.config import Config
 from wdc.tools import ComputerUse
+from wdc.safety import SafetyViolation
+
+
+def test_control_action_rechecks_live_properties_before_invoking(monkeypatch):
+    from contextlib import nullcontext
+
+    control = SimpleNamespace(ProcessId=20,Name="Live name",ControlTypeName="ButtonControl",
+        IsOffscreen=False,IsPassword=False,IsEnabled=True,GetChildren=lambda: [],
+        BoundingRectangle=SimpleNamespace(left=1,top=2,right=3,bottom=4),
+        Element=SimpleNamespace(GetRuntimeId=lambda: [1,2]))
+    uia = SimpleNamespace(UIAutomationInitializerInThread=nullcontext,ControlFromHandle=lambda _:control)
+    monkeypatch.setitem(sys.modules,"uiautomation",uia)
+    monkeypatch.setattr(desktop_targets,"target_window",lambda *args,**kwargs: (100,20,(0,0,100,100)))
+    monkeypatch.setattr(desktop_targets,"invoke",lambda *_: pytest.fail("Changed control must not be invoked"))
+    expected = {"name":"Old name","type":"ButtonControl","rect":[1,2,3,4]}
+    with pytest.raises(SafetyViolation) as failure:
+        desktop_targets.uia_controls(100,20,select=("1.2","invoke","",expected))
+    assert failure.value.code == "stale_control"
+
+
+def test_cached_reader_batches_child_properties_and_honors_process_scope(monkeypatch):
+    from types import ModuleType
+
+    names = ("ProcessId","Name","ControlType","BoundingRectangle","IsOffscreen","IsPassword","IsEnabled","RuntimeId")
+    ids = SimpleNamespace(**{name+"Property":index for index,name in enumerate(names)})
+    properties = []
+    subtree_reads = []
+    request = SimpleNamespace(AddProperty=properties.append)
+    class Element:
+        def __init__(self,pid,label,kind,children=(),password=False):
+            self.CachedProcessId,self.CachedName,self.CachedControlType = pid,label,kind
+            self.CachedIsEnabled,self.CachedIsOffscreen,self.CachedIsPassword = True,False,password
+            self.CachedBoundingRectangle = SimpleNamespace(left=2,top=4,right=10,bottom=20)
+            self.children = children
+
+        def GetCachedPropertyValue(self,prop):
+            assert prop == ids.RuntimeIdProperty
+            return [3,self.CachedControlType]
+
+        def FindAllBuildCache(self,scope,condition,cache):
+            assert scope == 2 and cache is request
+            subtree_reads.append(self.CachedName)
+            return SimpleNamespace(Length=len(self.children),GetElement=self.children.__getitem__)
+
+    root = Element(20,"Window",1,[Element(20,"Open",2),Element(20,"Open",2,password=True),Element(21,"Open",2)])
+    automation = SimpleNamespace(CreateCacheRequest=lambda: request,RawViewCondition=object(),
+        ElementFromHandleBuildCache=lambda hwnd,cache:root,CreateTrueCondition=lambda:object())
+    fixture = ModuleType("uiautomation.uiautomation")
+    fixture.ControlTypeNames = {1:"WindowControl",2:"ButtonControl"}
+    fixture._AutomationClient = SimpleNamespace(instance=lambda:SimpleNamespace(IUIAutomation=automation))
+    monkeypatch.setitem(sys.modules,"uiautomation.uiautomation",fixture)
+    result = desktop_targets._cached_uia(SimpleNamespace(PropertyId=ids),12,20,"open","buttoncontrol",40,float("inf"),None)
+    assert len(properties) == 8 and subtree_reads == ["Window","Open","Open"]
+    assert result == {"controls":[{"id":"3.2","name":"Open","type":"ButtonControl","rect":[2,4,10,20],
+                                   "enabled":True,"depth":1}],"truncated":False}
 
 
 def test_ocr_matches_multi_word_labels_without_crossing_lines():

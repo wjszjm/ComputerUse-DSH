@@ -63,6 +63,7 @@ class Frame:
     captured_monotonic: float = field(default_factory=time.monotonic)
     revision: int = 0
     context_window: tuple | None = None
+    context_focus: tuple | None = None
     context_layout: tuple | None = None
     invalid_reason: str = ""
     capture_target: tuple[int, int] | None = None

@@ -285,7 +285,7 @@ def move(x: int, y: int, duration: float = 0.15) -> dict[str, Any]:
 
 
 def click(x: int, y: int, button: str = "left", clicks: int = 1,
-          interval: float = 0.05, duration: float = 0.0) -> dict[str, Any]:
+          interval: float = 0.05, duration: float = 0.0, *, validate=None) -> dict[str, Any]:
     backend = get_backend()
     button = (button or "left").lower()
     if button in {"l", "1"}:
@@ -304,27 +304,30 @@ def click(x: int, y: int, button: str = "left", clicks: int = 1,
     if _cancel_check.get() is not None and clicks > 1:
         for index in range(clicks):
             check_cancelled()
+            if validate is not None: validate()
             backend.click(int(x), int(y), button=button, clicks=1, interval=interval)
             if index + 1 < clicks:
                 cancellable_sleep(interval)
     else:
+        if validate is not None: validate()
         backend.click(int(x), int(y), button=button, clicks=clicks, interval=interval)
     px, py = backend.position()
     return {"button": button, "clicks": clicks, "position": [px, py]}
 
 
 def drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5,
-         button: str = "left") -> dict[str, Any]:
+         button: str = "left", *, validate=None) -> dict[str, Any]:
     check_cancelled()
     backend = get_backend()
     button = (button or "left").lower()
     if button not in {"left", "right", "middle"}:
         raise ValueError("button 只支持 left / right / middle")
     impl = getattr(backend, "drag", None)
-    if callable(impl) and not pointer_events.enabled():
+    if callable(impl) and not pointer_events.enabled() and validate is None:
         impl(int(x1), int(y1), int(x2), int(y2), duration=float(duration), button=button)
     else:  # 极简后端没有 drag 时的兜底实现
         _move_feedback(backend, x1, y1)
+        if validate is not None: validate()
         backend.mouse_down(button)
         try:
             _move_feedback(backend, x2, y2, float(duration))
@@ -335,7 +338,7 @@ def drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5,
 
 
 def scroll(amount: int, x: int | None = None, y: int | None = None,
-           horizontal: bool = False) -> dict[str, Any]:
+           horizontal: bool = False, *, validate=None) -> dict[str, Any]:
     backend = get_backend()
     amount = int(amount)
     check_cancelled()
@@ -346,12 +349,13 @@ def scroll(amount: int, x: int | None = None, y: int | None = None,
             _move_feedback(backend, x, y)
         else:
             pointer_events.position(*backend.position())
+    if validate is not None: validate()
     backend.scroll(amount, x=x, y=y, horizontal=horizontal)
     return {"scrolled": amount, "horizontal": horizontal,
             "at": [int(x), int(y)] if x is not None and y is not None else None}
 
 
-def _paste_text(text: str, interval: float = 0.0) -> bool:
+def _paste_text(text: str, interval: float = 0.0, validate=None) -> bool:
     """用剪贴板粘贴非 ASCII 文本（pyautogui.write 不支持中文/表情）。
 
     返回 True 表示走的是粘贴通道。
@@ -376,6 +380,7 @@ def _paste_text(text: str, interval: float = 0.0) -> bool:
         backend = get_backend()
         cancellable_sleep(0.06)
         check_cancelled()
+        if validate is not None: validate()
         with held_keys(backend, ["ctrl"]):
             check_cancelled()
             backend.press("v")
@@ -391,7 +396,7 @@ def _paste_text(text: str, interval: float = 0.0) -> bool:
 
 
 def type_text(text: str, interval: float = 0.02, press_enter: bool = False,
-              use_clipboard: str = "auto") -> dict[str, Any]:
+              use_clipboard: str = "auto", *, validate=None) -> dict[str, Any]:
     """输入文本。use_clipboard: auto | always | never。
 
     auto：纯 ASCII 且较短时逐字输入，其余走剪贴板粘贴（对中文/长文本更稳）。
@@ -411,7 +416,7 @@ def type_text(text: str, interval: float = 0.02, press_enter: bool = False,
     )
 
     if need_paste:
-        if _paste_text(text, interval):
+        if _paste_text(text, interval,validate):
             method = "clipboard-paste"
         else:
             if use_clipboard == "always":
@@ -420,32 +425,35 @@ def type_text(text: str, interval: float = 0.02, press_enter: bool = False,
                 raise InputError(
                     "文本包含非 ASCII 字符，需要 pyperclip 才能输入，请先 pip install pyperclip"
                 )
-            _write_text(backend, text, float(interval))
+            _write_text(backend, text, float(interval),validate)
     else:
-        _write_text(backend, text, float(interval))
+        _write_text(backend, text, float(interval),validate)
 
     if press_enter:
         check_cancelled()
+        if validate is not None: validate()
         backend.press("enter")
     return {"chars": len(text), "method": method, "press_enter": bool(press_enter)}
 
 
-def _write_text(backend, text: str, interval: float) -> None:
-    if _cancel_check.get() is None:
+def _write_text(backend, text: str, interval: float, validate=None) -> None:
+    if _cancel_check.get() is None and validate is None:
         backend.write(text, interval=interval)
         return
     for char in text:
         check_cancelled()
+        if validate is not None: validate()
         backend.write(char, interval=interval)
 
 
-def press_key(chord: str, repeat: int = 1, hold_ms: int = 0) -> dict[str, Any]:
+def press_key(chord: str, repeat: int = 1, hold_ms: int = 0, *, validate=None) -> dict[str, Any]:
     keys = parse_chord(chord)
     backend = get_backend()
     repeat = max(1, min(int(repeat), 50))
 
     for _ in range(repeat):
         check_cancelled()
+        if validate is not None: validate()
         if hold_ms and hold_ms > 0:
             with held_keys(backend, keys):
                 cancellable_sleep(hold_ms / 1000.0)

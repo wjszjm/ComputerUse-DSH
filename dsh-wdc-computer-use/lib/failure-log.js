@@ -11,6 +11,7 @@ const knownCodes = new Set([
   'approval_unavailable', 'approval_error', 'permission_context_missing',
   'service_start_failed', 'service_exited', 'service_unavailable', 'service_busy',
   'catalog_mismatch', 'rpc_error', 'transport_error', 'timeout', 'bridge_error',
+  'python_version_mismatch', 'stale_control', 'capture_context_changed', 'uia_read_unavailable',
   'outcome_unknown', 'stop_signal_failed', 'image_delivery_unavailable',
   'image_delivery_failed', 'image_delivery_timeout', 'image_resized', 'invalid_screenshot_frame',
   'result_conversion_failed', 'tool_failed',
