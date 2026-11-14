@@ -86,6 +86,7 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
   return child;
 }}});
 const {apply, McpBridge,annotateSchema,pruneSchema,buildDescription} = await import('../dsh-wdc-computer-use/lib/index.js');
+const {supportsCompactHistory} = await import('../dsh-wdc-computer-use/lib/context-budget.js');
 const imageRef={attachmentId:'attachment-test',mediaType:'image/png',bytes:68,width:1,height:1};
 const testAttachments={saveImage:async()=>imageRef};
 const options = {
@@ -95,6 +96,15 @@ const options = {
   initTimeoutMs:1000, callTimeoutMs:1000,
   stopFile:path.join(runtime,'stop.flag'),
 };
+
+test('history support requires the installed replay projection and not the optional summarizer', () => {
+  const agents = {turnBoundaryOf() {}};
+  const meter = {estimateMessage() {}};
+  const nativeProjection = {type:'image/offload',project() {}};
+  assert.equal(supportsCompactHistory({messageProjections:[nativeProjection]},agents,meter),true);
+  assert.equal(supportsCompactHistory({messageProjections:[],registerMessageProjection() {}},agents,meter),false);
+  assert.equal(supportsCompactHistory({messageProjections:[nativeProjection]},agents,null),false);
+});
 
 test('bridge handshake, tool list and call use an in-memory child', async () => {
   const bridge = new McpBridge(options,()=>{});

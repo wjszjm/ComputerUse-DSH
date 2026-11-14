@@ -26,7 +26,7 @@ import {TOOL_CATALOG} from './tool-catalog.js';
 import {recordFailure} from './failure-log.js';
 import {pluginName, pluginVersion, versionLabel} from './version.js';
 import {mountSettings, optionalTools} from './settings.js';
-import {createLazyTools, supportsLazyTools, pruneObservations, queryKey, resultVerified} from './context-budget.js';
+import {createLazyTools, supportsLazyTools, supportsCompactHistory, pruneObservations, queryKey, resultVerified} from './context-budget.js';
 
 export const name = 'wdc-computer-use';
 export const inject = [];
@@ -880,10 +880,7 @@ export function apply(ctx, config) {
   function contextSupport() {
     return {
       lazyAdvancedTools:supportsLazyTools(ctx.get?.('tools')),
-      compactHistory:typeof ctx.get?.('sessions')?.registerMessageProjection === 'function' &&
-        typeof ctx.get?.('tokenMeter')?.estimateMessage === 'function' &&
-        typeof ctx.get?.('agents')?.turnBoundaryOf === 'function' &&
-        typeof ctx.get?.('compaction')?.compactIfNeeded === 'function',
+      compactHistory:supportsCompactHistory(ctx.get?.('sessions'),ctx.get?.('agents'),ctx.get?.('tokenMeter')),
     };
   }
   mountSettings(ctx,options,()=>statusPayload,()=>executions>0 || bridge.activeMutations>0 || bridge.inDoubt.size>0,contextSupport);
@@ -893,8 +890,12 @@ export function apply(ctx, config) {
       if (step===1 && agent?.session && !signal?.aborted && contextSupport().compactHistory &&
           !bridge.activeMutations && !bridge.inDoubt.size && lastPruned.get(agent.session)!==turn) {
         try {
-          pruneObservations(agent.session,turn,ctx.get('tokenMeter'),signal);
-          lastPruned.set(agent.session,turn);
+          const boundary = ctx.get('agents').turnBoundaryOf(agent.session);
+          // The released replay validator accepts tool result replacements only in an open turn.
+          if (boundary?.openTurnStartSeq != null && boundary.lastTurn === turn) {
+            pruneObservations(agent.session,turn,ctx.get('tokenMeter'),signal);
+            lastPruned.set(agent.session,turn);
+          }
         } catch {
           recordFailure('tool_result','history_compaction_failed');
         }

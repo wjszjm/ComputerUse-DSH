@@ -12,6 +12,14 @@ export function supportsLazyTools(tools) {
   return typeof tools?.resolve === 'function' && typeof tools?.executable === 'function';
 }
 
+export function supportsCompactHistory(sessions, agents, meter) {
+  return typeof agents?.turnBoundaryOf === 'function' &&
+    typeof meter?.estimateMessage === 'function' &&
+    Array.isArray(sessions?.messageProjections) &&
+    sessions.messageProjections.some(projection => projection.type === 'image/offload' &&
+      typeof projection.project === 'function');
+}
+
 export function createLazyTools(selected, options) {
   const allowed = Object.freeze(selected.map(({name})=>name).filter(name=>advanced.has(name)));
   const loaded = new WeakMap();
