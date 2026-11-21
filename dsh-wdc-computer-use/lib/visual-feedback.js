@@ -1,5 +1,6 @@
 /** Display-only feedback. No desktop, filesystem, process, or network access. */
 export const FEEDBACK_STATES = Object.freeze({
+  starting: Object.freeze({label:'正在启动', tone:'waiting'}),
   idle: Object.freeze({label:'空闲', tone:'quiet'}),
   observing: Object.freeze({label:'正在观察', tone:'active'}),
   clicking: Object.freeze({label:'点击中', tone:'active'}),

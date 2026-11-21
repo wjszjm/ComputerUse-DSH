@@ -5,12 +5,12 @@ import {VisualFeedback,FEEDBACK_STATES,feedbackSvg,mountFeedback} from '../dsh-w
 const create=settings=>new VisualFeedback({settings:{enabled:true,...settings},clock:()=>0,
   viewport:{x:0,y:0,width:800,height:600},workArea:{x:0,y:0,width:800,height:560}});
 
-test('disabled by default; all ten states use fixed labels and no arbitrary text',()=>{
+test('disabled by default; all states use fixed labels and no arbitrary text',()=>{
   const off=new VisualFeedback({clock:()=>0});
   assert.equal(off.snapshot().visible,false);
   assert.equal(off.recordClick(10,10),false);
   const model=create();
-  assert.equal(Object.keys(FEEDBACK_STATES).length,10);
+  assert.equal(FEEDBACK_STATES.starting.label,'正在启动');
   for(const [state,info] of Object.entries(FEEDBACK_STATES)){
     model.setState(state);assert.equal(model.snapshot().label,info.label);
     assert.match(feedbackSvg(model.snapshot()),/focusable="false"/);

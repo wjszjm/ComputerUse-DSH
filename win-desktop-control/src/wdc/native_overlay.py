@@ -20,9 +20,15 @@ WDA_EXCLUDEFROMCAPTURE=0x11
 WM_CLOSE=0x10
 WM_TIMER=0x113
 WM_APP_UPDATE=0x8001
+WM_APP_STOP=0x8002
 HTTRANSPARENT=-1
 MA_NOACTIVATE=3
 WNDPROC=getattr(C,'WINFUNCTYPE',C.CFUNCTYPE)(C.c_ssize_t,W.HWND,W.UINT,W.WPARAM,W.LPARAM)
+HOOKPROC=getattr(C,'WINFUNCTYPE',C.CFUNCTYPE)(C.c_ssize_t,C.c_int,W.WPARAM,W.LPARAM)
+
+
+class KeyboardEvent(C.Structure):
+    _fields_=[('vk',W.DWORD),('scan',W.DWORD),('flags',W.DWORD),('time',W.DWORD),('extra',C.c_size_t)]
 
 
 class WNDCLASSEX(C.Structure):
@@ -54,7 +60,7 @@ class OverlayUnavailable(RuntimeError):
 
 
 class WindowsApi:
-    """Bind pointer-sized results explicitly; no input/focus APIs are imported."""
+    """Bind pointer-sized window and emergency stop APIs explicitly."""
     def __init__(self):
         if sys.platform!='win32' or sys.getwindowsversion().build<19041:
             raise OverlayUnavailable('capture_exclusion_requires_windows_2004')
@@ -88,6 +94,9 @@ class WindowsApi:
             'SelectObject':(self.gdi,W.HANDLE,[W.HDC,W.HANDLE]),
             'DeleteObject':(self.gdi,W.BOOL,[W.HANDLE]),
             'PostMessageW':(self.user,W.BOOL,[W.HWND,W.UINT,W.WPARAM,W.LPARAM]),
+            'SetWindowsHookExW':(self.user,W.HANDLE,[C.c_int,HOOKPROC,W.HINSTANCE,W.DWORD]),
+            'UnhookWindowsHookEx':(self.user,W.BOOL,[W.HANDLE]),
+            'CallNextHookEx':(self.user,C.c_ssize_t,[W.HANDLE,C.c_int,W.WPARAM,W.LPARAM]),
             'PostQuitMessage':(self.user,None,[C.c_int]),
             'SetTimer':(self.user,C.c_size_t,[W.HWND,C.c_size_t,W.UINT,C.c_void_p]),
             'KillTimer':(self.user,W.BOOL,[W.HWND,C.c_size_t]),
@@ -106,6 +115,9 @@ class NativeWindows:
         self.windows=[]
         self.closed=False
         self.registered=False
+        self.escape_hook=None
+        self.escape_callback=None
+        self.escape_posted=False
         self.class_name=f'WDCFeedback-{os.getpid()}'
         self.instance=self.api.GetModuleHandleW(None)
         self.callback=WNDPROC(self._wndproc)
@@ -128,8 +140,22 @@ class NativeWindows:
                 self.require_exclusion(hwnd)
             if not self.api.SetTimer(self.windows[0],1,250,None):
                 raise OverlayUnavailable('watchdog_unavailable')
+            if os.environ.get('WDC_OVERLAY_ESCAPE')=='1':
+                self.escape_callback=HOOKPROC(self._escape_key)
+                self.escape_hook=self.api.SetWindowsHookExW(13,self.escape_callback,self.instance,0)
+                if not self.escape_hook:
+                    raise OverlayUnavailable('escape_listener_unavailable')
         except Exception:
             self.close();raise
+
+    def _escape_key(self,code,message,data):
+        # Only physical Esc key-down can stop a service. Always pass the key
+        # through, and do no rendering or pipe I/O inside the hook.
+        if code==0 and message in {0x100,0x104} and data and not self.escape_posted and self.windows:
+            event=C.cast(data,C.POINTER(KeyboardEvent)).contents
+            if event.vk==0x1B and not event.flags & 0x12:
+                self.escape_posted=bool(self.api.PostMessageW(self.windows[0],WM_APP_STOP,0,0))
+        return self.api.CallNextHookEx(None,code,message,data)
 
     def _wndproc(self,hwnd,message,wparam,lparam):
         if message==0x84:return HTTRANSPARENT  # WM_NCHITTEST
@@ -137,6 +163,7 @@ class NativeWindows:
         try:
             if message==WM_CLOSE:self.on_message('close');return 0
             if message==WM_APP_UPDATE:self.on_message('update');return 0
+            if message==WM_APP_STOP:self.on_message('emergency_stop');return 0
             if message==WM_TIMER:self.on_message('watchdog');return 0
             if message==0x2E0:
                 if self.windows and hwnd==self.windows[0]:self.on_message('geometry')
@@ -160,7 +187,8 @@ class NativeWindows:
             raise OverlayUnavailable('invalid_work_area')
         dpi=self.api.GetDpiForWindow(self.windows[0])
         if dpi<72 or dpi>768:raise OverlayUnavailable('dpi_unavailable')
-        return {'viewport':viewport,'workArea':work,'uiScale':min(3,max(.75,dpi/96)),'captureExcluded':True}
+        return {'viewport':viewport,'workArea':work,'uiScale':min(3,max(.75,dpi/96)),
+                'captureExcluded':True,'startingLabel':True}
 
     def paint(self, hwnd, tile: Tile):
         self.require_exclusion(hwnd)
@@ -225,6 +253,9 @@ class NativeWindows:
     def close(self):
         if self.closed:return
         self.closed=True
+        if self.escape_hook:
+            self.api.UnhookWindowsHookEx(self.escape_hook)
+            self.escape_hook=None
         if self.windows:self.api.KillTimer(self.windows[0],1)
         for hwnd in reversed(self.windows):
             self.api.ShowWindow(hwnd,0);self.api.DestroyWindow(hwnd)

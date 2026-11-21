@@ -16,6 +16,7 @@ class OverlayController:
         self.backend=backend;self.emit=emit;self.clock=clock
         self.last_seen=clock();self.last_sequence=0;self.closed=False
         self.needs_refresh=False
+        self.emergency_hidden=False
         self.geometry=backend.geometry()
         if self.geometry.get('captureExcluded') is not True:raise ValueError('capture_exclusion_unavailable')
 
@@ -32,6 +33,9 @@ class OverlayController:
         if kind not in {'scene','heartbeat','close'}:raise ValueError('invalid_packet_type')
         self.last_seen=self.clock();self.last_sequence=sequence
         if kind=='close':self.close();return
+        if self.emergency_hidden:
+            self.emit({'type':'ack','sequence':sequence})
+            return
         if kind=='scene':
             try:
                 scene=validate_scene(packet['scene'],self.geometry['viewport'],self.geometry['workArea'])
@@ -61,6 +65,12 @@ class OverlayController:
         if age>2.5:self.backend.hide_all();self.needs_refresh=True
         if age>5:self.close()
 
+    def emergency_stop(self):
+        if self.closed or self.emergency_hidden:return
+        self.emergency_hidden=True
+        self.backend.hide_all()
+        self.emit({'type':'emergency_stop'})
+
     def close(self):
         if self.closed:return
         self.closed=True;self.backend.close()
@@ -76,6 +86,7 @@ def run(backend_factory=NativeWindows, stdin=None, stdout=None):
         if controller is None:return
         try:
             if event=='close':controller.close()
+            elif event=='emergency_stop':controller.emergency_stop()
             elif event=='watchdog':controller.watchdog()
             elif event=='geometry':controller.geometry_changed()
             elif event=='update':

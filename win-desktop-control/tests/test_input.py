@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ctypes
+from types import SimpleNamespace
+
 import pytest
 
 from wdc import input_ctl
@@ -44,6 +47,25 @@ def test_scroll(fake_backend):
     assert ("scroll", 3, None, None, False) in fake_backend.calls
     input_ctl.scroll(-2, x=10, y=20, horizontal=True)
     assert ("scroll", -2, 10, 20, True) in fake_backend.calls
+
+
+@pytest.mark.parametrize(("clicks", "horizontal", "flags", "delta"), [
+    (-3, False, 0x0800, -360), (2, True, 0x1000, 240),
+])
+def test_windows_wheel_uses_native_detents_and_axis(monkeypatch, clicks, horizontal, flags, delta):
+    from wdc import platform_win
+
+    def send(count, event, size):
+        assert count == 1
+        assert size == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
+        assert event._obj.type == 0
+        assert event._obj.mouse.flags == flags
+        assert ctypes.c_int32(event._obj.mouse.data).value == delta
+        return 1
+
+    monkeypatch.setattr(platform_win, "IS_WINDOWS", True)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=SimpleNamespace(SendInput=send)), raising=False)
+    assert platform_win.send_mouse_wheel(clicks, horizontal=horizontal)
 
 
 def test_type_text_ascii(fake_backend):

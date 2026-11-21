@@ -102,7 +102,7 @@ class InputBackend(Protocol):
 
 
 class PyAutoGUIBackend:
-    """基于 pyautogui 的后端（Windows 下最终调用 user32 SendInput）。"""
+    """Use PyAutoGUI for desktop input and native wheel events on Windows."""
 
     name = "pyautogui"
 
@@ -156,6 +156,17 @@ class PyAutoGUIBackend:
 
     def scroll(self, clicks: int, x: int | None = None, y: int | None = None,
                horizontal: bool = False) -> None:
+        if platform_win.IS_WINDOWS:
+            if x is not None and y is not None:
+                point = (int(x), int(y))
+                if self.position() != point:
+                    self.move_to(*point)
+                if self.position() != point:
+                    raise InputError("鼠标未到达滚动目标，请重新截图。")
+            check_cancelled()
+            if not platform_win.send_mouse_wheel(int(clicks), horizontal=horizontal):
+                raise InputError("Windows 未接收滚轮事件。")
+            return
         kwargs: dict[str, Any] = {"clicks": int(clicks)}
         if x is not None and y is not None:
             kwargs["x"], kwargs["y"] = int(x), int(y)

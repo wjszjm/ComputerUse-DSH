@@ -18,6 +18,33 @@ IS_LINUX = sys.platform.startswith("linux")
 _dpi_state: str | None = None
 
 
+class _MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_int32), ("dy", ctypes.c_int32), ("data", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32), ("time", ctypes.c_uint32), ("extra", ctypes.c_size_t),
+    ]
+
+
+class _MouseEvent(ctypes.Structure):
+    # MOUSEINPUT is the largest member of INPUT's union on Windows x86 and x64.
+    _fields_ = [("type", ctypes.c_uint32), ("mouse", _MouseInput)]
+
+
+def send_mouse_wheel(clicks: int, *, horizontal: bool = False) -> bool:
+    """Send a Windows wheel event with the requested number of detents."""
+    if not IS_WINDOWS:
+        return False
+    delta = clicks * 120  # WHEEL_DELTA
+    if not -32768 <= delta <= 32767:
+        raise ValueError("一次滚动最多支持 273 格。")
+    flags = 0x1000 if horizontal else 0x0800  # MOUSEEVENTF_HWHEEL / WHEEL
+    event = _MouseEvent(0, _MouseInput(0, 0, ctypes.c_uint32(delta).value, flags, 0, 0))
+    send = ctypes.windll.user32.SendInput
+    send.argtypes = [ctypes.c_uint32, ctypes.POINTER(_MouseEvent), ctypes.c_int]
+    send.restype = ctypes.c_uint32
+    return send(1, ctypes.byref(event), ctypes.sizeof(event)) == 1
+
+
 # --------------------------------------------------------------------------- #
 # DPI
 # --------------------------------------------------------------------------- #

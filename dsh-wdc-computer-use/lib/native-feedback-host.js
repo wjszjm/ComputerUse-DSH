@@ -21,6 +21,7 @@ export class NativeFeedbackHost {
     this.options=options;this.feedback=feedback;this.log=log;this.onStatus=onStatus;
     this.timers=timers;
     this.child=null;this.state='disabled';this.reason='not_enabled';this.ready=false;this.closed=false;
+    this.startingLabel=false;
     this.sequence=0;this.pending=null;this.dirty=false;this.unsubscribe=null;
     this.frame=null;this.heartbeat=null;this.deadline=null;this.startup=null;this.killTimer=null;
     this.exitWait=null;
@@ -35,7 +36,8 @@ export class NativeFeedbackHost {
     this.readyWait=new Promise(resolve=>{this.resolveReady=resolve;});
     try{
       const child=spawn(this.options.python,['-B','-m','wdc.overlay_host'],{cwd:this.options.cwd,windowsHide:true,
-        stdio:['pipe','pipe','pipe'],env:{...process.env,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8'}});
+        stdio:['pipe','pipe','pipe'],env:{...process.env,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8',
+          WDC_OVERLAY_ESCAPE:this.onEmergencyStop?'1':'0'}});
       this.child=child;
       child.once('error',()=>this.fail('process_error'));
       const exited=()=>{
@@ -66,6 +68,7 @@ export class NativeFeedbackHost {
         this.fail('capture_or_geometry_unavailable');return;
       }
       this.ready=false;
+      this.startingLabel=message.startingLabel===true;
       this.feedback.setGeometry(message.viewport,message.workArea);
       if(!Object.hasOwn(this.options.feedbackSettings||{},'uiScale'))this.feedback.configure({uiScale:Math.min(3,Math.max(.75,message.uiScale))});
       this.ready=true;this.state='ready';this.reason='ready';this.timers.clearTimeout(this.startup);this.startup=null;
@@ -81,6 +84,7 @@ export class NativeFeedbackHost {
       this.pending=null;this.timers.clearTimeout(this.deadline);this.deadline=null;
       if(this.dirty)this.flush();
     }else if(message.type==='refresh'){this.dirty=true;this.flush();}
+    else if(message.type==='emergency_stop'&&Object.keys(message).length===1&&this.onEmergencyStop)this.onEmergencyStop();
     else if(message.type==='disabled')this.fail('worker_disabled');
     else throw Error('invalid_response');
   }
@@ -88,6 +92,7 @@ export class NativeFeedbackHost {
     if(!this.ready||this.closed||this.pending!==null||!this.child)return;
     try{
       const scene=this.feedback.snapshot();this.dirty=false;
+      if(scene.state==='starting'&&!this.startingLabel)scene.state='waiting';
       this.send({type:'scene',scene:nativeScene(scene)});
       if(scene.animated&&this.frame===null)this.frame=this.timers.setTimeout(()=>{this.frame=null;this.dirty=true;this.flush();},50);
     }catch{this.fail('scene_failed');}

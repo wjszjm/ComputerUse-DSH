@@ -51,6 +51,7 @@ export class FeedbackSession {
   #disposed=false;
   #warn;
   #activeOnly=false;
+  #servicePhase=null;
   #pointer=null;
   #clock;
   constructor({enabled=false,settings={},viewport,workArea,clock,activeOnly=false,onObserverError=()=>{}}={}) {
@@ -78,10 +79,14 @@ export class FeedbackSession {
       if(mark.x>=v.x&&mark.y>=v.y&&mark.x<v.x+v.width&&mark.y<v.y+v.height){
         scene.pointer={x:mark.x,y:mark.y,scale:this.settings.uiScale};scene.animated=true;
         const b=scene.badge;
-        if(b&&mark.x>=b.x-32&&mark.y>=b.y-32&&mark.x<=b.x+b.width+32&&mark.y<=b.y+b.height+32)scene.badge=null;
+        if(this.#servicePhase===null&&b&&mark.x>=b.x-32&&mark.y>=b.y-32&&mark.x<=b.x+b.width+32&&mark.y<=b.y+b.height+32)scene.badge=null;
       }
     }
-    if(!this.#geometryKnown||this.#disposed||(this.#activeOnly&&!this.#operations.size&&!this.#control.busy)){scene.visible=false;scene.badge=null;scene.rings=[];scene.pointer=null;scene.animated=false;}
+    if(this.#servicePhase!==null&&!this.#operations.size){scene.rings=[];scene.pointer=null;scene.animated=false;}
+    const hidden=this.#servicePhase===null
+      ? this.#activeOnly&&!this.#operations.size&&!this.#control.busy
+      : this.#servicePhase==='hidden';
+    if(!this.#geometryKnown||this.#disposed||hidden){scene.visible=false;scene.badge=null;scene.rings=[];scene.pointer=null;scene.animated=false;}
     return {...scene,geometryKnown:this.#geometryKnown,activeOperations:this.#operations.size};
   }
   subscribe(listener){
@@ -134,6 +139,15 @@ export class FeedbackSession {
     this.#control={stopped:stopped===true,busy:busy===true};this.#refresh();
   }
   setTransportAvailable(available){if(this.#disposed)return;this.#transportFault=!available;this.#refresh();}
+  setServicePhase(phase){
+    if(this.#disposed||this.#servicePhase===phase)return;
+    this.#servicePhase=phase;
+    if(phase==='starting'){
+      this.#fault=false;this.#remoteStopped=false;
+      this.#pointer=null;
+    }
+    this.#refresh();
+  }
   dispose(){
     if(this.#disposed)return;
     this.#operations.clear();this.#model.configure({enabled:false});this.#model.setState('idle');
@@ -142,11 +156,13 @@ export class FeedbackSession {
   #refresh(){
     let state='idle';
     if(this.#control.stopped||this.#remoteStopped)state=this.#fault?'error':this.#control.busy?'stopping':'stopped';
+    else if(this.#servicePhase==='starting')state='starting';
     else if(this.#transportFault)state='error';
     else if(this.#operations.size){
       let top=-1;
       for(const operation of this.#operations.values())if(PRIORITY[operation.state]>=top){state=operation.state;top=PRIORITY[state];}
     }else if(this.#fault)state='error';
+    else if(this.#servicePhase==='ready')state='waiting';
     this.#model.setState(state);this.#publish();
   }
   #publish(){for(const listener of [...this.#listeners])this.#deliver(listener);}

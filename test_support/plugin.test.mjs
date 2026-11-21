@@ -52,7 +52,7 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
       queueMicrotask(()=>{if(child.exitCode===null)child.stdout.write(JSON.stringify({type:'ack',sequence:packet.sequence})+'\n');});done();
     },final(done){exit();done();}});
     child.kill=()=>{child.killed=true;exit();};displayChildren.push(child);
-    queueMicrotask(()=>child.stdout.write(JSON.stringify({type:'ready',captureExcluded:true,uiScale:1,
+    queueMicrotask(()=>child.stdout.write(JSON.stringify({type:'ready',captureExcluded:true,startingLabel:true,uiScale:1,
       viewport:{x:0,y:0,width:1920,height:1080},workArea:{x:0,y:0,width:1920,height:1040}})+'\n'));
     return child;
   }
@@ -74,8 +74,10 @@ mock.module('node:child_process', {namedExports:{spawn(command,args,options) {
       }
       if (scenario.killName && scenario.killName === request.params?.name) { child.kill(); continue; }
       if ((scenario.hangMethod && scenario.hangMethod === request.method) || (scenario.hangName && scenario.hangName === request.params?.name) || scenario.hangNames?.includes(request.params?.name)) continue;
-      const result = request.method === 'initialize' ? {serverInfo:{name:'memory-server',version:scenario.pythonVersion ?? pluginVersion}, instructions:'Mock safety instructions'}
-        : request.method === 'tools/list' ? {tools:scenario.catalogMismatch ? [] : TOOL_CATALOG.tools}
+      const result = request.method === 'initialize' ? {
+        protocolVersion: scenario.protocolVersion ?? request.params.protocolVersion,
+        serverInfo:{name:'memory-server',version:scenario.pythonVersion ?? pluginVersion}, instructions:'Mock safety instructions'}
+        : request.method === 'tools/list' ? {tools:scenario.catalog ?? TOOL_CATALOG.tools}
         : (typeof scenario.callResult==='function'?scenario.callResult(request):scenario.callResult) || {content:[{type:'text',text:JSON.stringify({ok:true,action:request.params.name})}]};
       queueMicrotask(()=>{if(!child.killed) child.reply(request.id,result);});
     }
@@ -545,7 +547,7 @@ test('bridge feedback drives the actual SVG renderer and disposal cancels its an
   }finally{unsubscribe();view.destroy();b.close();}
 });
 
-for(const listError of [false,true])test(`apply native opt-in is dormant until a call, then closes (listError=${listError})`,async()=>{
+for(const listError of [false,true])test(`native display follows service readiness and handshake failure (listError=${listError})`,async()=>{
   const before=children.length, displaysBefore=displayChildren.length;
   const m=await mounted({listError,hangName:listError?undefined:'click'},
     {feedbackEnabled:true,feedbackNativeEnabled:true});
@@ -561,7 +563,9 @@ for(const listError of [false,true])test(`apply native opt-in is dormant until a
     }
     const result=await pending;assert.equal(result.ok,!listError);
     await new Promise(setImmediate);
-    assert.equal(displayChildren.at(-1).exitCode,0);
+    const display=displayChildren.at(-1);
+    assert.equal(display.exitCode,listError?0:null);
+    if(!listError)assert.ok(display.packets.some(p=>p.scene?.visible&&p.scene?.state==='waiting'));
   } finally {m.close();}
   assert.equal(children.at(-1).killed,true);
 });
@@ -720,12 +724,21 @@ test('history requires exact evidence and retains distinct, uncertain and legacy
   assert.deepEqual(changes,[['image/offload',{targets:[{seq:8,imageIndexes:[0]},{seq:1,imageIndexes:[0]}]}]]);
 });
 
-test('bridge rejects a different Python candidate before tool dispatch',async()=>{
-  const m=await mounted({pythonVersion:'2.2.1'});
+test('bridge accepts a different Python package version when the protocol and catalog match',async()=>{
+  const m=await mounted({pythonVersion:'2.3.0-rc.1'});
   try {
-    assert.match((await m.tools.find(t=>t.name==='wdc_wait').execute({})).text,/python_version_mismatch/);
-    assert.equal(children.at(-1).requests.some(request=>request.method==='tools/call'),false);
+    const result=await m.tools.find(t=>t.name==='wdc_wait').execute({});
+    assert.equal(result.ok,true);
+    assert.deepEqual(children.at(-1).requests.map(request=>request.method),['initialize','tools/list','tools/call']);
   } finally {m.close();}
+});
+
+test('bridge rejects an unsupported negotiated MCP protocol before dispatch',async()=>{
+  const bridge=faultBridge({protocolVersion:'2099-01-01'});
+  try {
+    await assert.rejects(bridge.callTool('wait',{}),{code:'mcp_protocol_mismatch'});
+    assert.deepEqual(children.at(-1).requests.map(request=>request.method),['initialize']);
+  } finally {bridge.close();}
 });
 
 test('a timed-out unisolated read retires its worker and a later read starts a new one',async()=>{
@@ -833,7 +846,7 @@ test('stop during cold input handshake prevents dispatch and survives process re
   try {
     const input=b.callTool('type_text',{text:'never send'});await tick();
     const child=b.child;await b.callTool('stop',{});
-    child.reply(child.requests[0].id,{serverInfo:{name:'mock'}});
+    child.reply(child.requests[0].id,{protocolVersion:child.requests[0].params.protocolVersion,serverInfo:{name:'mock'}});
     await assert.rejects(input,e=>e.code==='emergency_stop');
     assert.ok(!child.requests.some(r=>r.method==='tools/call'));
     await delay(50);assert.equal(b.child,null);
@@ -883,14 +896,22 @@ test('idle restart rejects old implicit image coordinates before sending input',
   }finally{b.close();}
 });
 
-test('catalog mismatch rejects the first action, without input replay or a false unknown-outcome latch',async()=>{
-  const m=await mounted({catalogMismatch:true});
-  try {
-    const result=await m.tools.find(t=>t.name==='wdc_type_text').execute({text:'never send'});
-    assert.equal(result.ok,false);assert.match(result.text,/catalog_mismatch/);
-    assert.ok(!children.at(-1).requests.some(r=>r.method==='tools/call'));
-    assert.equal(children.at(-1).killed,true);
-  }finally{m.close();}
+test('catalog mismatch names the incompatible tool without dispatching input',async()=>{
+  const withoutClick=TOOL_CATALOG.tools.filter(tool=>tool.name!=='click');
+  const requiredChanged=TOOL_CATALOG.tools.map(tool=>tool.name==='click'
+    ? {...tool,inputSchema:{...tool.inputSchema,required:[...tool.inputSchema.required,'button']}}
+    : tool);
+  for (const [catalog,detail] of [[withoutClick,/click.*未提供/],[requiredChanged,/click.*必填项不同 button/]]) {
+    const m=await mounted({catalog});
+    try {
+      const result=await m.tools.find(t=>t.name==='wdc_type_text').execute({text:'never send'});
+      assert.equal(result.ok,false);
+      assert.match(result.text,/catalog_mismatch/);
+      assert.match(result.text,detail);
+      assert.ok(!children.at(-1).requests.some(r=>r.method==='tools/call'));
+      assert.equal(children.at(-1).killed,true);
+    }finally{m.close();}
+  }
 });
 
 test('unload during cold start cannot dispatch a late input',async()=>{
@@ -901,19 +922,61 @@ test('unload during cold start cannot dispatch a late input',async()=>{
   assert.ok(!child.requests.some(r=>r.method==='tools/call'));assert.equal(b.idleTimer,null);
 });
 
-test('subsequent native calls reopen only after closing the previous display; idle has no animation',async()=>{
-  const m=await mounted({}, {feedbackEnabled:true,feedbackNativeEnabled:true});
+test('native display stays visible across tools, closes on idle retirement, then reopens for the next worker',async()=>{
+  const m=await mounted({}, {feedbackEnabled:true,feedbackNativeEnabled:true,idleTimeoutMs:1000});
   try {
-    for(let i=0;i<2;i++){
-      const result=await m.tools.find(t=>t.name==='wdc_wait').execute({ms:0});
-      assert.equal(result.ok,true);await tick();
-      const child=displayChildren.at(-1),count=child.packets.length;
-      assert.equal(child.exitCode,0);await delay(20);assert.equal(child.packets.length,count);
-    }
-    assert.ok(displayChildren.slice(-2).every(c=>c.exitCode===0));
+    const wait=m.tools.find(t=>t.name==='wdc_wait');
+    assert.equal((await wait.execute({ms:0})).ok,true);await tick();
+    const display=displayChildren.at(-1), worker=children.at(-1);
+    const count=display.packets.length;
+    assert.equal(display.exitCode,null);
+    assert.equal((await wait.execute({ms:0})).ok,true);await tick();
+    assert.equal(displayChildren.at(-1),display);assert.equal(children.at(-1),worker);
+    const scenes=display.packets.slice(count).filter(packet=>packet.type==='scene').map(packet=>packet.scene);
+    assert.ok(scenes.some(scene=>scene.state==='waiting'));
+    assert.ok(scenes.every(scene=>scene.visible===true));
+    assert.ok(scenes.some(scene=>scene.state==='waiting'&&scene.badge?.compact===false&&!scene.pointer));
+    assert.ok(scenes.every(scene=>scene.state!=='idle'));
+    await delay(1050);
+    assert.equal(display.exitCode,0);assert.equal(worker.killed,true);
+    assert.equal((await wait.execute({ms:0})).ok,true);
+    assert.notEqual(displayChildren.at(-1),display);
   }finally{m.close();}
 });
 
+test('end of the owning DSH turn closes the overlay while Python stays warm',async()=>{
+  const m=await mounted({}, {feedbackEnabled:true,feedbackNativeEnabled:true});
+  try {
+    const session={},event=m.hooks.get('session/event');
+    const wait=m.tools.find(t=>t.name==='wdc_wait');
+    event(session,{type:'step/start',data:{turn:7,step:1}});
+    assert.equal((await wait.execute({ms:0},execution('wdc_wait',session))).ok,true);await tick();
+    const worker=children.at(-1),display=displayChildren.at(-1);
+    event({}, {type:'turn/end',data:{turn:7}});
+    event(session,{type:'turn/end',data:{turn:6}});
+    await tick();assert.equal(display.exitCode,null);
+    event(session,{type:'turn/end',data:{turn:7}});
+    await tick();assert.equal(display.exitCode,0);assert.equal(worker.killed,false);
+    assert.equal((await wait.execute({ms:0},execution('wdc_wait',session))).ok,true);
+    assert.equal(children.at(-1),worker);assert.notEqual(displayChildren.at(-1),display);
+  }finally{m.close();}
+});
+test('native Esc signal stops an idle service and the overlay stays closed until resume',async()=>{
+  const m=await mounted({}, {feedbackEnabled:true,feedbackNativeEnabled:true});
+  try {
+    const wait=m.tools.find(t=>t.name==='wdc_wait');
+    assert.equal((await wait.execute({ms:0})).ok,true);await tick();
+    const display=displayChildren.at(-1);
+    display.stdout.write('{"type":"emergency_stop"}\n');
+    await tick();
+    assert.equal(display.exitCode,0);
+    const blocked=await m.tools.find(t=>t.name==='wdc_click').execute({x:10,y:20,coordinate_mode:'screen'});
+    assert.equal(blocked.ok,false);assert.match(blocked.text,/emergency_stop/);
+    assert.equal(displayChildren.at(-1),display);
+    assert.equal((await m.tools.find(t=>t.name==='wdc_resume').execute({})).ok,true);await tick();
+    assert.notEqual(displayChildren.at(-1),display);
+  }finally{m.close();}
+});
 
 test('pointer events bind live request, ignore stale children/sequences, and vanish on stop/completion',async()=>{
   const b=faultBridge({hangName:'click'},feedbackOptions);await b.start();
@@ -1128,7 +1191,7 @@ test('revocation during cold start prevents input dispatch',async()=>{
   try{
     const pending=m.tools.find(t=>t.name==='wdc_click').execute({x:1,y:2},exec);await tick();
     const child=children.at(-1);m.policy.setMode(exec.agent.session,'disabled');
-    child.reply(child.requests[0].id,{serverInfo:{name:'mock'}});
+    child.reply(child.requests[0].id,{protocolVersion:child.requests[0].params.protocolVersion,serverInfo:{name:'mock'}});
     const result=await pending;assert.equal(result.ok,false);
     assert.ok(!child.requests.some(r=>r.method==='tools/call'));
   }finally{m.close();}

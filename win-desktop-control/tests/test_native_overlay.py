@@ -11,7 +11,7 @@ import pytest
 
 from wdc.native_overlay import (NativeWindows, OverlayUnavailable, OVERLAY_EX_STYLE, WS_POPUP,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, WDA_EXCLUDEFROMCAPTURE, MONITORINFO, BITMAPINFO, BLENDFUNCTION,
-    WM_CLOSE, HTTRANSPARENT, MA_NOACTIVATE)
+    WM_CLOSE, WM_APP_STOP, KeyboardEvent, HTTRANSPARENT, MA_NOACTIVATE)
 from wdc.overlay_host import OverlayController, run
 from wdc.overlay_scene import Tile, validate_scene, render_tiles
 
@@ -89,6 +89,23 @@ def test_window_flags_exclusion_and_no_focus_calls():
     assert api.calls[-1][0]=='unregister'
 
 
+def test_physical_escape_posts_one_stop_without_intercepting_key_events(monkeypatch):
+    api=FakeApi()
+    api.SetWindowsHookExW=lambda *_:200
+    api.UnhookWindowsHookEx=lambda handle:api.calls.append(('unhook',handle))
+    api.CallNextHookEx=lambda *_:17
+    monkeypatch.setenv('WDC_OVERLAY_ESCAPE','1')
+    native=NativeWindows(api=api)
+    try:
+        for key,flags in [(0x1B,0x10),(0x41,0),(0x1B,0),(0x1B,0)]:
+            event=KeyboardEvent(key,0,flags,0,0)
+            assert native._escape_key(0,0x100,C.addressof(event))==17
+        assert [call for call in api.calls if call[0]=='post']==[('post',native.windows[0],WM_APP_STOP,0,0)]
+    finally:
+        native.close()
+    assert ('unhook',200) in api.calls
+
+
 @pytest.mark.parametrize('failed_window',[1,2,3])
 def test_capture_exclusion_failure_never_shows_a_window(failed_window):
     api=FakeApi(fail_affinity=failed_window)
@@ -156,6 +173,16 @@ class Backend:
     def render(self,tiles):self.calls.append(('render',tiles))
     def hide_all(self):self.calls.append(('hide',))
     def close(self):self.closed=True;self.calls.append(('close',))
+
+
+def test_emergency_stop_hides_and_disregards_late_visible_scene():
+    backend=Backend();events=[];control=OverlayController(backend,events.append)
+    control.receive({'type':'scene','sequence':1,'scene':scene()})
+    control.emergency_stop()
+    control.emergency_stop()
+    control.receive({'type':'scene','sequence':2,'scene':scene()})
+    assert [call[0] for call in backend.calls]==['render','hide']
+    assert events==[{'type':'ack','sequence':1},{'type':'emergency_stop'},{'type':'ack','sequence':2}]
 
 
 def test_protocol_stale_sequence_watchdog_and_recovery_request():

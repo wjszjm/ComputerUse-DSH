@@ -18,7 +18,7 @@ The command previews changes by default. Add `--apply` after exiting DSH through
 
 The command verifies the installed files and profile entries before returning. Start DSH and run the version check below to confirm the active profile loaded the intended package. The settings copy is local and can contain absolute paths.
 
-Use the Python wheel and Node package from the same candidate or release. The plugin checks the backend version at startup. The Windows x64 wheel can include the Windows Graphics Capture fallback for background window screenshots. To build it from source, run `pwsh -NoProfile -File scripts/build-window-capture.ps1` with MSVC and a Windows SDK that includes C++/WinRT, then build the wheel. The base source install supports the existing PrintWindow backend.
+Starting with Node plugin 2.3.1, Node and Python package versions can differ. The plugin checks the negotiated MCP protocol and enabled tools' names, parameter names, and required fields at startup. Both package versions appear in installation diagnostics. The Windows x64 wheel can include the Windows Graphics Capture fallback for background window screenshots. To build it from source, run `pwsh -NoProfile -File scripts/build-window-capture.ps1` with MSVC and a Windows SDK that includes C++/WinRT, then build the wheel. The base source install supports the existing PrintWindow backend.
 
 ## Before installation
 

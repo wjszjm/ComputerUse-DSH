@@ -10,7 +10,7 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-LABELS = {'idle':'空闲', 'observing':'正在观察', 'clicking':'点击中', 'typing':'输入中',
+LABELS = {'starting':'正在启动', 'idle':'空闲', 'observing':'正在观察', 'clicking':'点击中', 'typing':'输入中',
           'scrolling':'滚动中', 'operating':'操作中', 'waiting':'等待界面响应',
           'stopping':'正在停止', 'stopped':'已停止', 'error':'需要处理'}
 MAX_PACKET = 16384

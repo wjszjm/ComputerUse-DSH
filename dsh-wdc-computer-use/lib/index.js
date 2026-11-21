@@ -119,6 +119,25 @@ const DEFAULTS = {
 
 const PROTOCOL_VERSION = '2024-11-05';
 
+function catalogDifference(expected, actual) {
+  if (!actual) return '后端未提供这个工具';
+  const actualProperties = actual.inputSchema?.properties;
+  const actualRequired = actual.inputSchema?.required ?? [];
+  if (!actualProperties || typeof actualProperties !== 'object' || Array.isArray(actualProperties) ||
+      !Array.isArray(actualRequired) || actualRequired.some(key => typeof key !== 'string')) {
+    return '后端参数定义无效';
+  }
+  const expectedProperties = Object.keys(expected.inputSchema.properties);
+  const missing = expectedProperties.filter(key => !Object.hasOwn(actualProperties, key));
+  if (missing.length) return `后端缺少参数 ${missing.join(', ')}`;
+  if (Object.keys(actualProperties).length !== expectedProperties.length) return '后端提供了不同的参数集合';
+  const required = new Set(expected.inputSchema.required || []);
+  const changed = expectedProperties.filter(key => required.has(key) !== actualRequired.includes(key));
+  if (changed.length) return `必填项不同 ${changed.join(', ')}`;
+  if (actualRequired.length !== required.size) return '后端必填项定义无效';
+  return null;
+}
+
 /**
  * 精简 JSON Schema，压掉纯冗余。
  *
@@ -208,10 +227,12 @@ class McpBridge {
     /** 服务端在 initialize 响应里下发的使用指引（标准循环 / 坐标规则 / 安全约束） */
     this.instructions = '';
     try {
-      this.feedback = new FeedbackSession({enabled:options.feedbackEnabled,settings:options.feedbackSettings,
+      this.feedback = new FeedbackSession({enabled:options.feedbackEnabled,
+        settings:options.onDisplayWorker?{...options.feedbackSettings,compactIdle:false}:options.feedbackSettings,
         activeOnly:true,
         viewport:options.feedbackViewport,workArea:options.feedbackWorkArea,
         onObserverError:()=>{try{this.log('操作提示观察者已禁用，不影响工具执行');}catch{}}});
+      if(options.onDisplayWorker)this.feedback.setServicePhase('hidden');
     } catch {
       this.feedback = new FeedbackSession();
       try{this.log('操作提示配置无效，已关闭提示，不影响工具执行');}catch{}
@@ -281,8 +302,17 @@ class McpBridge {
 
   refreshFeedbackControl() {
     // The safety state remains authoritative; rendering cannot change it.
-    this.feedbackInvoke('setControl',{stopped:this.isStopped(),
+    const stopped=this.isStopped();
+    this.feedbackInvoke('setControl',{stopped,
       busy:this.activeMutations>0||[...this.inDoubt.values()].some(child=>this.exits.has(child))});
+    this.syncDisplayWorker(stopped);
+  }
+
+  syncDisplayWorker(stopped=this.isStopped()) {
+    if(!this.options.onDisplayWorker)return;
+    const worker=this.closed||stopped?null:this.child;
+    this.feedbackInvoke('setServicePhase',worker?(this.ready?'ready':'starting'):'hidden');
+    this.options.onDisplayWorker(worker,this);
   }
 
   start() {
@@ -317,6 +347,7 @@ class McpBridge {
       }
 
       this.child = child;
+      this.syncDisplayWorker();
       let exited;
       this.exits.set(child, new Promise(resolveExit => { exited = resolveExit; }));
 
@@ -339,6 +370,7 @@ class McpBridge {
           this.starting = null;
           this.ready = false;
           this.needsFreshFrame = true;
+          this.syncDisplayWorker();
           if(!this.closed)this.feedbackInvoke('setTransportAvailable',false);
         }
         this.rejectPending(child, bridgeError('service_exited', 'WDC 服务进程已退出'));
@@ -368,24 +400,24 @@ class McpBridge {
       }, this.options.initTimeoutMs)
         .then(async (result) => {
           if (this.closed || this.child !== child) throw bridgeError('service_exited', '握手进程已失效');
+          const pythonVersion = versionLabel(result?.serverInfo?.version);
+          this.pythonHandshake = {version:pythonVersion,catalog:'unchecked'};
+          if (result?.protocolVersion !== PROTOCOL_VERSION) {
+            throw bridgeError('mcp_protocol_mismatch', 'Python 服务未协商出受支持的 MCP 协议（2024-11-05）。');
+          }
           this.notify('notifications/initialized', {});
           // 这段 instructions 是给模型的用法指导，不能丢——宿主没有系统提示注入点，
           // 后面会把它附到 screenshot 工具的描述里。
           this.instructions = typeof result?.instructions === 'string' ? result.instructions : '';
-          const pythonVersion = versionLabel(result?.serverInfo?.version);
-          if (this.options.requirePythonVersion && pythonVersion !== pluginVersion) {
-            this.pythonHandshake = {version:pythonVersion,catalog:'unchecked'};
-            throw bridgeError('python_version_mismatch', 'Node 插件和 Python 服务版本不一致，请使用同一候选版。');
-          }
           if (this.options.expectedTools) {
             const actual = await this.listTools();
+            if (this.closed || this.child !== child) throw bridgeError('bridge_closed', '握手期间服务已关闭');
             for (const expected of this.options.expectedTools) {
               const found = actual.find(tool => tool.name === expected.name);
-              const keys = schema => Object.keys(schema?.properties || {}).sort().join(',');
-              const required = schema => [...(schema?.required || [])].sort().join(',');
-              if (!found || keys(found.inputSchema) !== keys(expected.inputSchema) || required(found.inputSchema) !== required(expected.inputSchema)) {
-                if (!this.closed && this.child === child) this.pythonHandshake = {version:pythonVersion, catalog:'mismatch'};
-                throw bridgeError('catalog_mismatch', '服务工具定义与安装包不一致，请更新配套安装包。');
+              const reason = catalogDifference(expected, found);
+              if (reason) {
+                this.pythonHandshake = {version:pythonVersion, catalog:'mismatch'};
+                throw bridgeError('catalog_mismatch', `工具 ${expected.name} 不兼容：${reason}。`);
               }
             }
           }
@@ -425,7 +457,10 @@ class McpBridge {
 
   retire(child, error) {
     if (!child) return;
-    if (this.child === child) { this.child = null; this.starting = null; this.ready = false; this.needsFreshFrame = true; this.feedbackInvoke('setTransportAvailable',false); }
+    if (this.child === child) {
+      this.child = null; this.starting = null; this.ready = false; this.needsFreshFrame = true;
+      this.syncDisplayWorker();this.feedbackInvoke('setTransportAvailable',false);
+    }
     this.rejectPending(child, error);
     try { child.stdin.end(); } catch { /* Closing only our own transport. */ }
     try { child.kill(); } catch { /* Restart waits for actual exit. */ }
@@ -565,9 +600,10 @@ class McpBridge {
     this.stopped = true;
     this.inputRevision += 1;
     this.controlVersion += 1;
-    mkdirSync(path.dirname(this.stopFile()), { recursive: true });
-    writeFileSync(this.stopFile(), 'stop\n', 'utf8');
-    this.refreshFeedbackControl();
+    try {
+      mkdirSync(path.dirname(this.stopFile()), { recursive: true });
+      writeFileSync(this.stopFile(), 'stop\n', 'utf8');
+    } finally { this.refreshFeedbackControl(); }
   }
 
   observation(lease) {
@@ -762,6 +798,7 @@ class McpBridge {
     if (this.closed) return;
     this.closed = true;
     this.cancelIdle();
+    this.syncDisplayWorker();
     this.feedbackInvoke('dispose');
     if (this.child && (this.activeMutations || this.inDoubt.size)) {
       try { this.latchStop(); } catch { /* Keep the in-memory stop even if disk is unavailable. */ }
@@ -917,7 +954,7 @@ export function apply(ctx, config) {
   }
   options.expectedTools = TOOL_CATALOG.tools.filter(tool =>
     !OPT_IN_TOOLS.has(tool.name) || options.enableTools.includes(tool.name));
-  options.requirePythonVersion = true;
+  options.onDisplayWorker = reconcileDisplay;
   let bridge = createBridge();
   async function stopAll() {
     try { return await bridge.callTool('stop', {}); }
@@ -930,20 +967,55 @@ export function apply(ctx, config) {
     reportStatus({});
   }
   let nativeDisplay=new NativeFeedbackHost(options,bridge.feedback,log,onDisplayStatus);
-  let displayClosing=Promise.resolve(true), displayStarting=null, executions=0;
+  let displayRequest={worker:null}, displayReady=Promise.resolve(), executions=0;
+  const displayCalls=new Set(), displayTurns=new WeakMap();
+  let displayTail=null, displayTimer=null;
   options.onRuntimeState = runtime => reportStatus({runtime});
-  async function startDisplay() {
-    if (displayStarting) return displayStarting;
-    if (nativeDisplay.child || statusClosed || options.feedbackEnabled !== true || options.feedbackNativeEnabled !== true) return;
-    const task = (async () => {
-      const exited = await displayClosing;
-      if (!exited || statusClosed || !executions) return;
-      if (nativeDisplay.closed) nativeDisplay=new NativeFeedbackHost(options,bridge.feedback,log,onDisplayStatus);
-      nativeDisplay.start();
-      await nativeDisplay.readyWait;
-    })();
-    displayStarting=task;
-    try { await task; } finally { if(displayStarting===task)displayStarting=null; }
+
+  function clearDisplayTail() {
+    clearTimeout(displayTimer);
+    displayTimer=null;displayTail=null;
+  }
+  function beginDisplay(session) {
+    clearDisplayTail();
+    const call={session,turn:session&&displayTurns.get(session),ended:false};
+    displayCalls.add(call);
+    bridge.syncDisplayWorker();
+    return call;
+  }
+  function finishDisplay(call) {
+    if(!displayCalls.delete(call)||displayCalls.size)return;
+    if(!call.ended&&!statusClosed&&bridge.child&&!bridge.isStopped()){
+      displayTail=call;
+      displayTimer=setTimeout(()=>{
+        clearDisplayTail();
+        bridge.syncDisplayWorker();
+      },2000);
+      displayTimer.unref?.();
+    }
+    bridge.syncDisplayWorker();
+  }
+  function reconcileDisplay(worker,source) {
+    if(!displayCalls.size&&!displayTail)worker=null;
+    if(statusClosed||source!==bridge||worker===displayRequest.worker)return;
+    const request={worker};
+    displayRequest=request;
+    const closing=nativeDisplay.close();
+    displayReady=Promise.resolve();
+    if(!worker||options.feedbackEnabled!==true||options.feedbackNativeEnabled!==true)return;
+    displayReady=closing.then(exited=>{
+      if(!exited||statusClosed||displayRequest!==request)return;
+      const display=new NativeFeedbackHost(options,source.feedback,log,onDisplayStatus);
+      display.onEmergencyStop=()=>{
+        if(displayRequest!==request||nativeDisplay!==display||source.child!==worker)return;
+        // Hide and latch immediately without waiting for the current action to return.
+        try{source.latchStop();}
+        catch{recordFailure('tool_call','stop_signal_failed','stop');}
+        finally{permissions.stopAll();}
+      };
+      nativeDisplay=display;
+      if(display.start())return display.readyWait;
+    }).catch(()=>recordFailure('desktop_feedback','startup_failed'));
   }
   function reportStatus(update){
     if(statusClosed)return;
@@ -1028,6 +1100,13 @@ export function apply(ctx, config) {
     const type = event?.type;
     const turn = event?.data?.turn;
     const step = event?.data?.step;
+    if((type==='turn/start'||type==='step/start')&&Number.isSafeInteger(turn))displayTurns.set(session,turn);
+    if(type==='turn/end'){
+      const matches=call=>call.session===session&&(call.turn===undefined||call.turn===turn);
+      for(const call of displayCalls)if(matches(call))call.ended=true;
+      if(displayTail&&matches(displayTail)){clearDisplayTail();bridge.syncDisplayWorker();}
+      if(displayTurns.get(session)===turn)displayTurns.delete(session);
+    }
     if (type === 'tool/result' && event.data.meta?.wdc?.version === 2) {
       desktopTurns.set(session,turn);
     } else if (type === 'step/start' || type === 'llm/retry-started') {
@@ -1086,7 +1165,6 @@ export function apply(ctx, config) {
     if (statusClosed) {
       permissions = createPermissions();
       bridge = createBridge(bridge);
-      nativeDisplay = new NativeFeedbackHost(options,bridge.feedback,log,onDisplayStatus);
       statusClosed = false;
     }
     const currentBridge = bridge;
@@ -1175,7 +1253,7 @@ export function apply(ctx, config) {
                   if (tool.name !== 'stop') currentBridge.measure('approval',approvalStarted);
                 }
                 executions += 1;
-                let delivery;
+                let delivery, displayCall;
                 try {
                 // Stop is local and immediate, even while Python/display is starting.
                 const attachments = toolsCtx.get?.('attachments') ?? ctx.get?.('attachments');
@@ -1196,17 +1274,13 @@ export function apply(ctx, config) {
                 let result;
                 try {
                   lease?.check();
-                  if (tool.name !== 'stop') {
-                    const overlayStarted = performance.now();
-                    const displayReady = startDisplay().finally(() => currentBridge.measure('overlay',overlayStarted));
-                    if (tool.name !== 'resume' && !currentBridge.isStopped()) {
-                      const pythonStarted = performance.now();
-                      const pythonReady = (currentBridge.ready ? Promise.resolve() : currentBridge.ensureReady())
-                        .finally(() => currentBridge.measure('python_ready',pythonStarted));
-                      await Promise.all([displayReady,pythonReady]);
-                    } else {
-                      await displayReady;
-                    }
+                  if(tool.name!=='stop')displayCall=beginDisplay(lease?.session);
+                  if (tool.name !== 'stop' && tool.name !== 'resume' && !currentBridge.isStopped()) {
+                    const pythonStarted = performance.now();
+                    if(!currentBridge.ready)await currentBridge.ensureReady()
+                      .finally(() => currentBridge.measure('python_ready',pythonStarted));
+                    const overlayStarted=performance.now();
+                    await displayReady.finally(()=>currentBridge.measure('overlay',overlayStarted));
                     lease?.check();
                   }
                   result = tool.name === 'stop' ? await stopAll() : await currentBridge.callTool(tool.name, input,true,lease);
@@ -1257,8 +1331,8 @@ export function apply(ctx, config) {
                 } finally {
                   if (delivery) delivery.pending = false;
                   lease?.release();
+                  if(displayCall)finishDisplay(displayCall);
                   executions -= 1;
-                  if (!executions && !disposed) displayClosing=nativeDisplay.close();
                 }
               },
             }, lazy?.condition(tool.name));
@@ -1317,7 +1391,11 @@ export function apply(ctx, config) {
         }
       }
       manifest.length = 0;
-      displayClosing = nativeDisplay.close();
+      displayCalls.clear();
+      clearDisplayTail();
+      displayRequest={worker:null};
+      displayReady=Promise.resolve();
+      nativeDisplay.close();
       reportStatus({ok:false,stage:'disposed',registered:0,tools:[]});statusClosed=true;
       currentBridge.close();
     });
