@@ -18,7 +18,13 @@ $package = Join-Path $root 'win-desktop-control/src/wdc'
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 $cppwinrt = Join-Path $sdk.FullName 'cppwinrt'
 $arguments = @('/nologo','/O2','/std:c++20','/EHsc','/MT','/W4',"/I$cppwinrt","/Fo$staging/wgc_capture.obj",
-    "/Fe$package/wgc_capture.exe",(Join-Path $root 'win-desktop-control/native/wgc_capture.cpp'),
+    "/Fe$package/wgc_capture.exe",'win-desktop-control\native\wgc_capture.cpp',
     '/link','d3d11.lib','dwmapi.lib','windowsapp.lib','user32.lib')
-& cl.exe @arguments
-if ($LASTEXITCODE -ne 0) { throw "Windows Graphics Capture build failed ($LASTEXITCODE)." }
+# A relative source name keeps the build machine's checkout path out of __FILE__.
+Push-Location -LiteralPath $root
+try {
+    & cl.exe @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Windows Graphics Capture build failed ($LASTEXITCODE)." }
+} finally {
+    Pop-Location
+}

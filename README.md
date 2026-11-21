@@ -4,6 +4,14 @@
 
 > This repository provides a Windows Computer Use integration for DeepSeek Harness. The documentation is Chinese-first; issues and pull requests in English are welcome.
 
+## 2.3.3 更新
+
+- 在 DSH **设置 → 电脑操控**中启用桌面提示后，同一轮的连续工具调用共用一个状态框。DSH 本轮结束即隐藏；未收到结束事件时，两秒内没有新操作也会隐藏。Python 后台可以继续待用。
+- 提示显示期间按物理 Esc 可停止电脑操作并立即隐藏状态框。需要继续操作时，可调用 `wdc_resume`。提示框只显示操作状态。
+- Windows 滚轮按系统标准发送格数，并区分纵向和横向。Node 与 Python 通过 MCP 协议和工具接口判断兼容性，各自保留独立的版本号。
+
+发布包组合为 **Node 插件 2.3.3 + Windows x64 Python 后端 2.3.2**。从 [v2.3.3 发布页](https://github.com/wjszjm/ComputerUse-DSH/releases/tag/v2.3.3) 下载 Node `.tgz` 和 Python `.whl`，按 [安装与回退说明](docs/INSTALL.md) 升级。
+
 ## 功能
 
 - Python MCP 服务提供 24 个底层工具，DSH 标准档默认注册 14 个工具。窗口截图、UIA、OCR 和批量窗口操作按需启用。
@@ -29,7 +37,7 @@
 
 最多六步的窗口批次只接受有系统状态读回的窗口操作。步骤失败时返回已验证的步骤和失败位置。
 
-桌面提示启用时，物理 Esc 在服务运行及等待期间都能发出紧急停止，提示框立即关闭。设置中的备用停止快捷键仍在 Python 输入检查点生效。Windows 或控件提供程序已经开始执行的单次调用需要返回后才能停止。
+桌面提示显示时，物理 Esc 可发出紧急停止。设置中的停止快捷键也会在 Python 输入检查点生效。Windows 或控件提供程序已经开始执行的单次调用需要返回后才能停止。
 
 本次升级对照了 [dsh-computer-use-win](https://github.com/Yu-tao-Li/dsh-computer-use-win/tree/92d6b35) 的控件定位、批次结果和 DSH 设置设计。当前实现继续使用 Python MCP 和 DSH 原生图片附件。
 
