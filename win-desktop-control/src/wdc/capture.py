@@ -376,7 +376,7 @@ def encode(frame: Frame, fmt: str = "png", quality: int = 80) -> tuple[bytes, st
     if fmt in {"jpg", "jpeg"}:
         frame.image.convert("RGB").save(buffer, format="JPEG", quality=int(quality), optimize=True)
         return buffer.getvalue(), "image/jpeg"
-    frame.image.save(buffer, format="PNG", optimize=True, compress_level=6)
+    frame.image.save(buffer, format="PNG", optimize=False, compress_level=6)
     return buffer.getvalue(), "image/png"
 
 

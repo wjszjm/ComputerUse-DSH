@@ -28,10 +28,9 @@ from .tools import ComputerUse, ToolResult, observation_scope
 from .mcp_compat import ToolContext
 from . import pointer_events
 
-INSTRUCTIONS = """Operate the user's Windows desktop. Prefer an identified window and semantic controls when reliable.
-For visual targeting, pass image pixels and a fresh frame_id; the service maps coordinates. Input, changed window/layout, and frames older than 30 seconds require a new observation. Never bypass a stale frame with screen mode. Background frames are observation-only.
-In DSH, use the current session's screenshot for typing and shortcuts. Reinspect controls after input.
-Bind windows by handle and PID and resolve ambiguous matches before acting. A sent or not_verified result requires state readback or a fresh screenshot. Observe before retrying an uncertain action.
+INSTRUCTIONS = """Operate the user's Windows desktop. Bind windows by handle and PID. For a known control, try UIA by exact name before capturing an image. If UIA is unavailable or misses, capture the smallest known window region; use scale=1 for fine text. Run an exact OCR query on that frame if needed. Resolve ambiguity before input.
+Use image pixels and a fresh frame_id for visual targeting. In DSH, typing and shortcuts also need the current session's foreground frame. Reobserve after input, window or layout changes, or 30 seconds. Never bypass a stale frame with screen mode. Background frames are observation-only.
+Verify sent or not_verified results by reading target state or taking a fresh screenshot. If readback fails or is inconclusive, keep a fresh screenshot as evidence before retrying.
 Follow DSH approval and confirm irreversible actions with the user. Do not enter credentials or interact with lock or UAC screens. Stop on secure_desktop, emergency_stop, or read_only; do not retry."""
 
 

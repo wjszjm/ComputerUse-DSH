@@ -155,6 +155,41 @@ def test_native_size_window_crop_keeps_physical_origin_and_rejects_occlusion(app
     assert app.click(12,4,frame_id=shot.data["frame_id"]).code == "frame_context_changed"
 
 
+def test_locate_with_uia_first_then_reuse_native_crop_for_ocr(app, monkeypatch):
+    from wdc import desktop_targets
+
+    bounds = (5, 7, 205, 107)
+    monkeypatch.setattr(desktop_targets, "target_window", lambda handle, pid, **_: (handle, pid, bounds))
+    monkeypatch.setattr(desktop_targets, "window_at_point", lambda *_: True)
+    control = {"id": "1.2", "name": "保存", "type": "ButtonControl"}
+    controls = [control]
+    monkeypatch.setattr(app, "_read_controls", lambda *args, **kwargs: {"controls": controls, "truncated": False})
+    assert app.locate_target(100, 200, "保存").data == {"route": "uia", "control": control}
+    assert app.session.frame_snapshot()[0] is None
+
+    controls.clear()
+    assert app.locate_target(100, 200, "保存").code == "frame_required"
+    shot = app.window_screenshot(100, 200, scale=1, crop=[50, 20, 38, 29])
+    assert shot.ok and shot.data["image_size"] == [38, 29]
+    frame_id = shot.data["frame_id"]
+    words = [{"text": "保存", "rect": [6, 1, 12, 6], "line": 0}]
+    monkeypatch.setattr(desktop_targets, "ocr_words", lambda *args, **kwargs: words)
+    monkeypatch.setattr(app, "_read_controls", lambda *args, **kwargs: pytest.fail("OCR repeated UIA"))
+    monkeypatch.setattr(capture, "capture", lambda **kwargs: pytest.fail("OCR repeated capture"))
+
+    words.append({"text": "保存", "rect": [7, 16, 12, 6], "line": 1})
+    ambiguous = app.recognize_text(frame_id, language="zh-CN", query="保存", limit=1)
+    assert ambiguous.data["ambiguous"] and "image_point" not in ambiguous.data
+    words.pop()
+
+    result = app.recognize_text(frame_id, language="zh-CN", query="保存")
+    assert result.ok and result.data["pointer_input"] is True
+    assert result.data["image_point"] == [12, 4]
+    click = app.click(*result.data["image_point"], frame_id=frame_id)
+    assert click.ok and click.data["screen_point"] == [67, 31]
+    assert app.recognize_text(frame_id, language="zh-CN", query="保存").code == "stale_frame"
+
+
 def test_input_during_capture_makes_the_returned_frame_unusable_for_targeting(app,monkeypatch):
     actual=capture.capture
     def changed_capture(**kwargs):

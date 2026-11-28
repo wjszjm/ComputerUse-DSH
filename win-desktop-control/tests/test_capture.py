@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from io import BytesIO
+
+from PIL import Image
 import pytest
 
 from wdc import capture
@@ -48,6 +51,18 @@ def test_encode_png_and_jpeg(gui):
     jpg, mime2 = capture.encode(frame, "jpeg")
     assert png.startswith(b"\x89PNG") and mime == "image/png"
     assert jpg.startswith(b"\xff\xd8") and mime2 == "image/jpeg"
+
+
+def test_png_preserves_color_and_alpha():
+    image = Image.frombytes("RGBA", (2, 2), bytes(range(16)))
+    frame = capture.Frame(image, (0, 0), image.size, image.size, 1, "primary")
+    data, mime = capture.encode(frame, "png")
+
+    assert mime == "image/png"
+    with Image.open(BytesIO(data)) as decoded:
+        assert decoded.mode == image.mode
+        assert decoded.size == image.size
+        assert decoded.tobytes() == image.tobytes()
 
 
 def test_region_validation(gui):

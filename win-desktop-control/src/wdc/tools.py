@@ -469,8 +469,15 @@ class ComputerUse:
             words = words[:limit]
             if detail == "compact":
                 words = [{key:value for key,value in word.items() if key != "line"} for word in words]
-            return {"words":words,"frame_id":frame_id,"coordinate_space":"image","truncated":truncated,
-                    **({"ambiguous": len(words) > 1 or truncated} if query else {})}
+            result = {"words": words, "frame_id": frame_id, "coordinate_space": "image", "truncated": truncated}
+            if query:
+                result["ambiguous"] = len(words) > 1 or truncated
+                if len(words) == 1 and not truncated:
+                    left, top, width, height = words[0]["rect"]
+                    point = [left + width / 2, top + height / 2]
+                    if frame.contains_image_point(*point):
+                        result.update(image_point=point, pointer_input=not frame.background)
+            return result
         return self._finish("recognize_text",{},run)
 
     def locate_target(self, handle, expected_pid, name, frame_id=None, language="en-US", background=False, cancel=None):
